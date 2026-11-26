@@ -1,23 +1,20 @@
-version: '3.8'
-
 services:
   ctyun-dashboard:
-    build: .
-    image: ctyun-dashboard:latest
+    image: ghcr.io/wanyishao/ctyun-dashboard:latest
     container_name: ctyun-dashboard
     restart: unless-stopped
+    network_mode: "bridge"
     ports:
-      - "8571:8571"
+      - "127.0.0.1:8571:8571"
     environment:
       - TZ=Asia/Shanghai
       - PORT=8571
       - CTYUN_DATA_DIR=/app/data
+      - CTYUN_INSTANCE_NAME=ctyun-dashboard
     volumes:
       - ./data:/app/data
-      # 📡 移动公众（公众版）：镜像已内置公开签名常量，默认开箱即用，无需任何额外配置。
-      #    只有需要覆盖时（平台轮换 Key / 自定义凭据）才放文件，优先级：环境变量 > 覆盖文件 > 内置：
-      #    - ./data/ecloud_credentials.json       → 容器内 /app/data/ecloud_credentials.json
-      #    字段形状见 app/ecloud_engine/credentials.example.json。
+      # 移动公众可选覆盖凭据（默认已内置公开常量，无需配置）：
+      # - ./data/ecloud_credentials.json:/app/data/ecloud_credentials.json:ro
     deploy:
       resources:
         limits:

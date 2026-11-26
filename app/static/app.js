@@ -13,9 +13,10 @@ let allReceivedLogs = [];
 let renderedLogLines = new Map();
 // 【2026-09-24 用户要求·第三轮】默认显示「全部」，不再默认只显示「任务」分栏
 let activeLogFilter = 'all';
-let activePlatformFilter = 'all'; // 'all' | 'ctyun' | 'ydpc' | 'ecloud'
-let activeAccountViewTab = 'all'; // 'all' | 'ctyun' | 'ydpc' | 'ecloud'
-let currentAddPlatform = 'ctyun';  // 'ctyun' | 'ydpc' | 'ecloud'
+let activePlatformFilter = 'all'; // 'all' | 'ctyun' | 'ydpc' | 'ecloud' | 'teleagent' | 'system'
+let logSearchKeyword = '';
+let activeAccountViewTab = 'all'; // 'all' | 'ctyun' | 'ydpc' | 'ecloud' | 'teleagent'
+let currentAddPlatform = 'ctyun';  // 'ctyun' | 'ydpc' | 'ecloud' | 'teleagent'
 // 移动公众两段式登录：需要短信验证时后端返回 pendingId，这里保存中间态
 // （未声明时读取会抛 ReferenceError，故必须显式声明）
 let pendingEcloudLogin = null; // { pendingId, branch, mobile, name, user, password, keepaliveInterval }
@@ -25,9 +26,15 @@ let activeEditingAccId = null;
 let currentCaptchaChallenge = null;
 let qrPollingTimer = null;
 let currentQrCodeId = '';
+let taQrPollingTimer = null;
+let currentTaQrId = '';
 let smsCountdown = 0;
 let currentPowerDesktopId = '';
 let currentPowerAccountDesktops = [];
+
+// 默认通知模板（与后端 server.js 保持严格一致，打开弹窗不再为空）
+const DEFAULT_NOTIFY_TITLE_TEMPLATE = "{account} - {title}";
+const DEFAULT_NOTIFY_CONTENT_TEMPLATE = "{time}\n\n{account}\n\n{task} - {status}\n\n{content}";
 
 // 请求包装：自动携带 token
 async function authFetch(url, options = {}) {
@@ -240,6 +247,10 @@ function openModal(id) {
 
 function closeModal(id) {
   document.getElementById(id).classList.add("hidden");
+  if (id === 'account-modal') {
+    if (qrPollingTimer) { clearInterval(qrPollingTimer); qrPollingTimer = null; }
+    if (taQrPollingTimer) { clearInterval(taQrPollingTimer); taQrPollingTimer = null; }
+  }
 }
 
 // 1. 加载系统统计
@@ -329,10 +340,12 @@ function switchAccountViewTab(tab) {
   const tabCt = document.getElementById("view-tab-ctyun");
   const tabYd = document.getElementById("view-tab-ydpc");
   const tabEc = document.getElementById("view-tab-ecloud");
+  const tabTa = document.getElementById("view-tab-teleagent");
   if (tabAll) tabAll.className = tab === 'all' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
   if (tabCt) tabCt.className = tab === 'ctyun' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
   if (tabYd) tabYd.className = tab === 'ydpc' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
   if (tabEc) tabEc.className = tab === 'ecloud' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
+  if (tabTa) tabTa.className = tab === 'teleagent' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
   renderAccounts();
 }
 
@@ -388,6 +401,7 @@ function getFilteredAccounts() {
     if (activeAccountViewTab === 'ctyun') return acc.platform === 'ctyun' || !acc.platform;
     if (activeAccountViewTab === 'ydpc') return acc.platform === 'ydpc';
     if (activeAccountViewTab === 'ecloud') return acc.platform === 'ecloud';
+    if (activeAccountViewTab === 'teleagent') return acc.platform === 'teleagent';
     return true;
   });
 }
@@ -487,18 +501,26 @@ function buildOfficialTasksHtml(m) {
 
 // 计算单账号多机周期的综合概览展示文本 (支持单机差异化周期精准动态呈现)
 // 注：天翼云以「秒」为表达单位，移动爱家与移动公众以「分钟」为表达单位（各自习惯不同）。
+function formatIntervalLabel(sec, useMinutes) {
+  const n = parseInt(sec, 10) || 0;
+  if (useMinutes) return `${Math.max(1, Math.round(n / 60))} 分钟`;
+  if (n >= 60 && n % 60 === 0) return `${n / 60} 分钟`;
+  return `${n}s`;
+}
+
 function buildIntervalOverviewText(acc) {
   const isYdpc = acc.platform === 'ydpc';
   const isEcloud = acc.platform === 'ecloud';
-  const useMinutes = isYdpc || isEcloud;
-  const fallbackSec = isYdpc ? 600 : (isEcloud ? 300 : 30);
+  const isTeleagent = acc.platform === 'teleagent';
+  const useMinutes = isYdpc || isEcloud || isTeleagent;
+  const fallbackSec = isYdpc ? 600 : ((isEcloud || isTeleagent) ? 300 : 30);
   const defaultIntervalSec = parseInt(acc.keepaliveInterval || acc.pulseIntervalSeconds) || fallbackSec;
   const items = isYdpc ? (acc.vms || []) : (acc.desktops || []);
 
   // 1. 若仅有 1 台云电脑，直接精准展示该主机的实际生效周期
   if (items.length === 1) {
     const singleSec = parseInt(items[0].keepaliveInterval) || defaultIntervalSec;
-    return useMinutes ? `${Math.round(singleSec / 60)} 分钟` : `${singleSec}s`;
+    return formatIntervalLabel(singleSec, useMinutes);
   }
 
   // 2. 若有多台云电脑
@@ -507,19 +529,20 @@ function buildIntervalOverviewText(acc) {
     const allSame = itemIntervals.every(v => v === itemIntervals[0]);
     // 若多台云电脑设置的周期全部相同，直接统一展示该周期
     if (allSame) {
-      return useMinutes ? `${Math.round(itemIntervals[0] / 60)} 分钟` : `${itemIntervals[0]}s`;
+      return formatIntervalLabel(itemIntervals[0], useMinutes);
     }
     // 周期各不相同时，展示多机独立详情
     const parts = items.map(it => {
       const sec = parseInt(it.keepaliveInterval) || defaultIntervalSec;
       const rawName = String(it.vmName || it.machineName || it.desktopName || '主机');
       const shortName = rawName.slice(0, 4);
-      return `${shortName} ${useMinutes ? Math.round(sec / 60) + '分' : sec + 's'}`;
+      const unitStr = (useMinutes || (sec >= 60 && sec % 60 === 0)) ? `${Math.max(1, Math.round(sec / 60))}分` : `${sec}s`;
+      return `${shortName} ${unitStr}`;
     });
     return `多机独立 (${parts.join(' · ')})`;
   }
 
-  return useMinutes ? `${Math.round(defaultIntervalSec / 60)} 分钟` : `${defaultIntervalSec}s`;
+  return formatIntervalLabel(defaultIntervalSec, useMinutes);
 }
 
 // ====================================================
@@ -628,6 +651,92 @@ function buildYdpcVmMonitorHtml(acc) {
         </div>
         <div title="${escapeHtml(timeLineFull)}" style="font-size: 11.5px; color: #475569; padding-left: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${timeLine}${actionLine ? ' · ' + actionLine : ''}</div>
         ${view.hintText ? `<div style="font-size: 11px; color: #94a3b8; padding-left: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(view.hintText)}</div>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+// ====================================================
+// 🌟 天翼星辰（TeleAgent）：独立逐台保活监视渲染
+// ====================================================
+const TELEAGENT_TONE_COLORS = {
+  ok: '#16a34a',
+  idle: '#0284c7',
+  warn: '#d97706',
+  off: '#94a3b8',
+  error: '#dc2626',
+  unknown: '#7c3aed'
+};
+const TELEAGENT_TONE_DOTS = {
+  ok: '🟢', idle: '🔵', warn: '🟠', off: '⚪', error: '🔴', unknown: '🟣'
+};
+
+function formatTeleagentRemainText(sec) {
+  if (sec === null || sec === undefined || isNaN(sec)) return '';
+  const s = Math.max(0, Math.round(Number(sec)));
+  if (s < 60) return `${s} 秒`;
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m} 分钟`;
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  return rest > 0 ? `${h} 小时 ${rest} 分` : `${h} 小时`;
+}
+
+function buildTeleagentDesktopMonitorHtml(acc) {
+  const desktops = acc.desktops || acc.liveMetrics?.desktops || [];
+  if (!desktops.length) {
+    return '<div style="font-size: 12px; color: var(--text-muted); padding: 4px 0;">暂未拉取到名下云主机，点击下方「同步实例」或「立即保活」自动拉取</div>';
+  }
+
+  return desktops.map(d => {
+    const iid = String(d.instanceId || d.id || '');
+    const taName = d.desktopName || '星辰云电脑';
+    const view = d.keepAliveView || null;
+
+    if (!view) {
+      return `
+        <div class="ta-mon-row" style="display: flex; flex-direction: column; gap: 2px; padding: 5px 0; border-top: 1px dashed var(--border);">
+          <div style="display: flex; align-items: baseline; gap: 5px; overflow: hidden; white-space: nowrap; min-width: 0;">
+            <span style="flex-shrink: 0;">🟣</span>
+            <span style="font-size: 12px; font-weight: 700; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(taName)}</span>
+          </div>
+          <div style="font-size: 11.5px; color: #94a3b8; padding-left: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">当前动作: 等待后端状态同步…</div>
+        </div>
+      `;
+    }
+
+    const tone = view.tone || 'idle';
+    const toneColor = TELEAGENT_TONE_COLORS[tone] || '#64748b';
+    const dot = TELEAGENT_TONE_DOTS[tone] || '⚪';
+    const intervalSec = parseInt(view.intervalSec) || 300;
+    const intervalText = intervalSec >= 60 ? `${Math.round(intervalSec / 60)} 分钟` : `${intervalSec} 秒`;
+
+    let nextText = '';
+    if (view.elapsedSec !== null && view.elapsedSec !== undefined && view.remainSec >= 0) {
+      nextText = view.remainSec <= 0
+        ? ' · <b style="color: #0284c7;">即将巡检</b>'
+        : ` · 距下次 <b style="color: #0f172a;">${formatTeleagentRemainText(view.remainSec)}</b>`;
+    }
+
+    const lastText = view.elapsedSec !== null && view.elapsedSec !== undefined
+      ? `上次保活: <b style="color: #0f172a;">${formatTeleagentRemainText(view.elapsedSec)}前</b> · 周期: <b>${intervalText}</b>${nextText}`
+      : `周期: <b>${intervalText}</b>${nextText}`;
+
+    const taActionText = view.actionText || '待巡检';
+    const lastTextFull = htmlToPlainTitle(lastText);
+
+    return `
+      <div class="ta-mon-row" id="ta-mon-${acc.id}-${escapeHtml(iid)}" style="display: flex; flex-direction: column; gap: 2px; padding: 5px 0; border-top: 1px dashed var(--border);">
+        <div style="display: flex; align-items: baseline; gap: 5px; overflow: hidden; white-space: nowrap; min-width: 0;">
+          <span style="flex-shrink: 0;">${dot}</span>
+          <span style="font-size: 12px; font-weight: 700; color: #0f172a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(taName)}</span>
+        </div>
+        <div style="display: flex; align-items: baseline; gap: 4px; overflow: hidden; white-space: nowrap; min-width: 0; padding-left: 16px;">
+          <span style="flex-shrink: 0; font-size: 11.5px; color: #64748b;">当前动作:</span>
+          <span title="${escapeHtml(taActionText)}" style="font-size: 11.5px; color: ${toneColor}; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(taActionText)}</span>
+        </div>
+        <div title="${escapeHtml(lastTextFull)}" style="font-size: 11.5px; color: #475569; padding-left: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${lastText}</div>
+        <div title="instanceId: ${escapeHtml(iid)}" style="font-size: 11px; color: #94a3b8; padding-left: 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">instanceId: ${escapeHtml(iid)}</div>
       </div>
     `;
   }).join('');
@@ -781,6 +890,7 @@ function buildAccountCardElement(acc, slotIndex) {
 
   const isYdpc = acc.platform === 'ydpc';
   const isEcloud = acc.platform === 'ecloud';
+  const isTeleagent = acc.platform === 'teleagent';
   // 【2026-09-24 用户要求·第三轮】账号级「保活在线/离线待机」徽章（原 statusBadge）已删除，
   // 连带 isYdpcRealOnline 一并移除 —— 监视板块改为可折叠标题，不再显示该 logo。
 
@@ -789,6 +899,212 @@ function buildAccountCardElement(acc, slotIndex) {
   const isEditingThis = (activeEditingAccId === acc.id);
   const f = acc.features || {};
   const m = acc.liveMetrics || {};
+
+  if (isTeleagent) {
+    // ====================================================
+    // 🌟 天翼星辰（TeleAgent）云 Windows 专属卡片呈现
+    // ====================================================
+    const desktops = acc.desktops || m.desktops || [];
+    const desktopsCountText = desktops.length > 0 ? `名下云主机 (${desktops.length}台)` : '云主机';
+    const isGlobalKeepAliveOff = f.keepAlive === false;
+
+    let taMultiStatusBadge = '';
+    if (isGlobalKeepAliveOff) {
+      taMultiStatusBadge = `<span style="color: #94a3b8; font-weight: 600;">⚪ 全局保活已关闭</span>`;
+    } else {
+      const anyKeepOn = desktops.some(d => d.keepaliveEnabled !== false);
+      const allKeepOn = desktops.every(d => d.keepaliveEnabled !== false);
+      if (allKeepOn && desktops.length > 1) {
+        taMultiStatusBadge = `<span style="color: #10b981; font-weight: 600;">🟢 全量多机保活已激活</span>`;
+      } else if (anyKeepOn) {
+        taMultiStatusBadge = `<span style="color: #0284c7; font-weight: 600;">🟡 心跳+换票保活中</span>`;
+      } else {
+        taMultiStatusBadge = `<span style="color: #94a3b8; font-weight: 600;">⚪ 单机保活已全关</span>`;
+      }
+    }
+
+    const pointsText = m.points !== null && m.points !== undefined ? String(m.points) : (acc.stats?.points ?? '—');
+    const planText = m.planName || acc.stats?.planName || '';
+    const signedToday = !!m.signedToday;
+    const jwtDays = acc.jwtDaysLeft !== null && acc.jwtDaysLeft !== undefined ? `凭据剩 ${acc.jwtDaysLeft} 天` : (acc.hasJwt ? '凭据就绪' : '待登录');
+    const authModeText = acc.authMode === 'qrcode' ? '扫码授权' : '账密续期';
+
+    let desktopsHtml = '';
+    if (desktops.length > 0) {
+      desktopsHtml = `
+        <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 10px 12px;">
+          <div style="font-size: 12px; font-weight: 700; color: #334155; margin-bottom: 6px; display: flex; justify-content: space-between;">
+            <span>🖥️ ${desktopsCountText}</span>
+            <span id="acc-multi-status-${acc.id}">${taMultiStatusBadge}</span>
+          </div>
+          <div style="display: flex; flex-direction: column; gap: 6px;">
+            ${desktops.map(d => {
+              const iid = String(d.instanceId || d.id || '');
+              const isKeepaliveOn = d.keepaliveEnabled !== false;
+              const view = d.keepAliveView || null;
+              const powerState = String((view && view.powerState) || d.powerState || '').toLowerCase();
+              const statusText = (view && view.statusText) || d.statusText || '状态未知';
+              const powerBadge = powerState === 'on'
+                ? `<span class="badge badge-online">运行中</span>`
+                : (powerState === 'off'
+                  ? `<span class="badge badge-offline">已关机</span>`
+                  : (powerState === 'starting' || powerState === 'queue'
+                    ? `<span class="badge" style="background:#fef3c7;color:#b45309;border:1px solid #fde68a;">${escapeHtml(statusText)}</span>`
+                    : `<span class="badge" style="background:#f1f5f9;color:#64748b;border:1px solid #cbd5e1;">${escapeHtml(statusText)}</span>`));
+
+              const iidLineText = `instanceId: ${iid || '—'}`;
+              let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
+              let keepText = isKeepaliveOn ? '开' : '关';
+              if (isGlobalKeepAliveOff && isKeepaliveOn) {
+                keepClass = 'pill-paused';
+                keepText = '待命(总关)';
+              }
+
+              return `
+                <div class="vm-device-item" id="ta-item-${acc.id}-${escapeHtml(iid)}">
+                  <div class="vm-device-header">
+                    <div style="display: flex; flex-direction: column; min-width: 0; flex: 1;">
+                      <div style="display: flex; align-items: center; gap: 6px; overflow: hidden; white-space: nowrap;">
+                        <span style="font-size: 12px; color: #0f172a; font-weight: 700; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;">${escapeHtml(d.desktopName || '星辰云电脑')}</span>
+                        ${d.specStr ? `<span class="badge" style="background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe;font-size:9.5px;padding:0 5px;line-height:1.3;">${escapeHtml(d.specStr)}</span>` : ''}
+                      </div>
+                      <div title="${escapeHtml(iidLineText)}" style="font-size: 11px; color: #64748b; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${escapeHtml(iidLineText)}</div>
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0; white-space: nowrap;">
+                      ${powerBadge}
+                      <button class="btn btn-sm btn-primary" style="padding: 2px 7px; font-size: 11px; flex-shrink: 0; white-space: nowrap;" onclick="openTeleagentDesktop('${acc.id}', '${escapeHtml(iid)}')" title="换取官方临时票据 URL 并在新标签页打开此台云电脑">🚀 打开</button>
+                    </div>
+                  </div>
+                  <div class="vm-device-footer">
+                    <div class="pill-btn-group">
+                      <button type="button" class="pill-toggle-btn ${keepClass}" id="pill-keep-${acc.id}-${escapeHtml(iid)}" onclick="toggleVmFeature('${acc.id}', '${escapeHtml(iid)}', 'keepaliveEnabled', ${!isKeepaliveOn})" title="单台云主机独立保活开关">⚡保活: ${keepText}</button>
+                      <select class="pill-select" id="pill-interval-${acc.id}-${escapeHtml(iid)}" onchange="changeVmInterval('${acc.id}', '${escapeHtml(iid)}', this.value)" title="单台云主机独立保活周期设置">
+                        <option value="" ${!d.keepaliveInterval ? 'selected' : ''}>⏱️继承默认</option>
+                        <option value="60" ${d.keepaliveInterval == 60 ? 'selected' : ''}>⏱️1分钟</option>
+                        <option value="180" ${d.keepaliveInterval == 180 ? 'selected' : ''}>⏱️3分钟</option>
+                        <option value="300" ${d.keepaliveInterval == 300 ? 'selected' : ''}>⏱️5分钟</option>
+                        <option value="600" ${d.keepaliveInterval == 600 ? 'selected' : ''}>⏱️10分钟</option>
+                        <option value="900" ${d.keepaliveInterval == 900 ? 'selected' : ''}>⏱️15分钟</option>
+                        <option value="1800" ${d.keepaliveInterval == 1800 ? 'selected' : ''}>⏱️30分钟</option>
+                      </select>
+                      <button type="button" class="pill-toggle-btn ${d.autoBootEnabled !== false ? 'pill-on-keepalive' : 'pill-off-keepalive'}" id="pill-autoboot-${acc.id}-${escapeHtml(iid)}" onclick="toggleVmFeature('${acc.id}', '${escapeHtml(iid)}', 'autoBootEnabled', ${d.autoBootEnabled === false})" title="单台云主机自动开机守护（关机或排队时自动调用 instance/start 拉起）">🛡️守护: ${d.autoBootEnabled !== false ? '开' : '关'}</button>
+                    </div>
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+        </div>
+      `;
+    } else {
+      desktopsHtml = `<div style="font-size: 12px; color: var(--text-muted); text-align: center; padding: 8px; background:#f8fafc; border-radius:6px; border:1px solid #e2e8f0;">暂未拉取到名下云主机，点击下方「同步实例」自动拉取</div>`;
+    }
+
+    card.innerHTML = `
+      <div class="card-top">
+        <div class="account-main-info">
+          <div class="account-avatar" id="acc-avatar-${acc.id}">${(displayName)[0].toUpperCase()}</div>
+          <div class="account-name-block">
+            <div class="account-name-row">
+              <span class="account-name-text ${isEditingThis ? 'hidden' : ''}" id="acc-name-text-${acc.id}" onclick="startInlineEditName('${acc.id}')" title="点击直接修改账号备注">
+                <span class="name-label" id="acc-name-val-${acc.id}">${escapeHtml(displayName)}</span>
+                <span class="name-edit-icon" title="点击直接修改备注">✏️</span>
+              </span>
+              <input type="text" class="inline-name-input ${isEditingThis ? '' : 'hidden'}" id="acc-name-input-${acc.id}" value="${escapeHtml(displayName)}" onkeydown="handleInlineNameKey(event, '${acc.id}')" onblur="saveInlineName('${acc.id}')" maxlength="30">
+            </div>
+            <div class="account-phone">
+              <span>${fullPhone}</span>
+              <span class="badge" style="background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe;">天翼星辰</span>
+              <span class="badge" style="background:#f8fafc;color:#475569;border:1px solid #cbd5e1;">${authModeText} · ${escapeHtml(jwtDays)}</span>
+            </div>
+          </div>
+        </div>
+        <div style="display: flex; gap: 4px; align-items: center; flex-shrink: 0;">
+          <button class="btn btn-sm" onclick="editAccount('${acc.id}')" title="编辑天翼星辰账号">✏️</button>
+          <button class="btn btn-sm btn-danger" onclick="deleteAccount('${acc.id}')" title="删除账号">🗑️</button>
+        </div>
+      </div>
+
+      <!-- 🖥️ 名下云主机列表 -->
+      ${desktopsHtml}
+
+      <!-- 🌟 天翼星辰专属：逐台保活监视 -->
+      <details class="features-box" ${isDetailsOpen(acc.id, 'ta-monitor') ? 'open' : ''} ontoggle="saveDetailsState('${acc.id}', 'ta-monitor', this.open)">
+        <summary style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-size: 12.5px; font-weight: 700; color: #334155; user-select: none; gap: 6px;">
+          <span style="color: #4338ca; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">🌟 天翼星辰 保活监视</span>
+          <span style="font-size: 11px; color: var(--text-muted); font-weight: normal; flex-shrink: 0; white-space: nowrap;">点击收起/展开</span>
+        </summary>
+        <div style="color: #475569; line-height: 1.7; display: flex; flex-direction: column; gap: 3px;">
+          <div id="acc-ta-mon-actions-${acc.id}" style="display: flex; flex-direction: column;">
+            ${buildTeleagentDesktopMonitorHtml(acc)}
+          </div>
+          <div id="acc-active-info-${acc.id}" style="font-size: 11.5px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">账号汇总: <b style="color: #0f172a;">今日 ${m.successCount || 0} 轮 · 心跳 ${m.heartbeats || 0} 次 · 自愈 ${m.healCount || 0} 次</b> · 周期: <b>${buildIntervalOverviewText(acc)}</b></div>
+        </div>
+      </details>
+
+      <!-- 积分与每日签到概览条（与天翼云任务总分位置统一：位于监控之下、自动化开关之上） -->
+      <div style="display: flex; justify-content: space-between; align-items: center; gap: 6px; padding: 7px 11px; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; font-size: 12px; flex-wrap: wrap;">
+        <div style="display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; white-space: nowrap;">
+          <span>🎁 积分: <b id="acc-ta-points-${acc.id}" style="color: #16a34a;">${escapeHtml(String(pointsText))}</b></span>
+          ${planText ? `<span style="color: #64748b;">(${escapeHtml(planText)})</span>` : ''}
+        </div>
+        <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0;">
+          <button type="button" class="pill-toggle-btn ${(acc.customCron && acc.customCron.enabled && acc.customCron.signCron) ? 'pill-on-task' : 'pill-off-task'}" id="ta-sign-cron-btn-${acc.id}" onclick="openTeleagentSignCronModal('${acc.id}')" title="${(acc.customCron && acc.customCron.enabled && acc.customCron.signCron) ? escapeHtml('已启用独立积分签到 Cron：' + acc.customCron.signCron) : '为 TeleAgent 每日积分任务配置独立 Cron 触发器（留空继承全局）'}">⏰${(acc.customCron && acc.customCron.enabled && acc.customCron.signCron) ? '定时:已配' : '定时规则'}</button>
+          <span id="acc-ta-sign-${acc.id}" class="badge ${signedToday ? 'badge-online' : 'badge-offline'}" title="每日登录积分 100 分（以官方 checkDayTask 核验为准）">${signedToday ? '✅ 今日已签到' : '⏳ 今日未签到'}</span>
+        </div>
+      </div>
+
+      <!-- ⚙️ 自动化保活与签到开关 -->
+      <details class="features-box" ${isDetailsOpen(acc.id, 'features') ? 'open' : ''} ontoggle="saveDetailsState('${acc.id}', 'features', this.open)">
+        <summary style="display: flex; justify-content: space-between; align-items: center; cursor: pointer; font-size: 12.5px; font-weight: 700; color: #334155; user-select: none; gap: 6px;">
+          <span style="min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">⚙️ 自动化保活与签到开关</span>
+          <span style="font-size: 11px; color: var(--text-muted); font-weight: normal; flex-shrink: 0; white-space: nowrap;">点击收起/展开</span>
+        </summary>
+        <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+          <div class="feature-row">
+            <span title="检测到实例关机或排队时自动调用 instance/start 远程拉起（双开关：本开关 + 单机「🛡️守护」，同机 10 分钟冷却）">🛡️ 自动开机守护</span>
+            <label class="switch">
+              <input type="checkbox" ${f.autoBoot !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'autoBoot', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="feature-row">
+            <span title="账号级保活总开关：每轮执行官方 refresh/heartbeat + instance/connect 换票保活">⚡ 账号级保活总开关</span>
+            <label class="switch">
+              <input type="checkbox" ${f.keepAlive !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'keepAlive', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="feature-row">
+            <span title="纳入主调度器每日定时自动领取 TeleAgent 福利社每日登录 100 积分">🎁 每日登录积分自动签到</span>
+            <label class="switch">
+              <input type="checkbox" ${f.autoSign !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'autoSign', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+          <div class="feature-row">
+            <span title="JWT 凭据剩余不足设定天数时自动使用已保存账密静默重登续期（仅账密模式有效）">🔑 凭据临期自动重登</span>
+            <label class="switch">
+              <input type="checkbox" ${f.autoRelogin !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'autoRelogin', this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+      </details>
+
+      <!-- 快捷操作区（2x2 均衡宽按钮布局，避免文字溢出遮挡；开机/重启已迁入电源管理防误触） -->
+      <div class="card-actions">
+        <div class="card-action-tools card-action-tools-2x2">
+          <button class="btn btn-tool" onclick="triggerTeleagentKeepalive('${acc.id}')" title="立即执行一轮心跳 + 换票保活">💓 立即保活</button>
+          <button class="btn btn-tool" onclick="triggerTeleagentSign('${acc.id}')" title="立即领取每日登录 100 积分（幂等复核）">🎁 立即签到</button>
+          <button class="btn btn-tool" onclick="syncTeleagentInstances('${acc.id}')" title="同步名下云主机状态与积分余额">🔄 同步实例</button>
+          <button class="btn btn-tool" onclick="openPowerModal('${acc.id}')" title="云主机电源管理（开机 / 重启 / 取消排队）">⚡ 电源管理</button>
+        </div>
+      </div>
+    `;
+
+    return card;
+  }
 
   if (isEcloud) {
     // ====================================================
@@ -880,6 +1196,8 @@ function buildAccountCardElement(acc, slotIndex) {
                       <button type="button" class="pill-toggle-btn ${keepClass}" id="pill-keep-${acc.id}-${escapeHtml(iid)}" onclick="toggleVmFeature('${acc.id}', '${escapeHtml(iid)}', 'keepaliveEnabled', ${!isKeepaliveOn})" title="单台云电脑独立保活开关">⚡保活: ${keepText}</button>
                       <select class="pill-select" id="pill-interval-${acc.id}-${escapeHtml(iid)}" onchange="changeVmInterval('${acc.id}', '${escapeHtml(iid)}', this.value)" title="单台云电脑独立保活周期设置">
                         <option value="" ${!d.keepaliveInterval ? 'selected' : ''}>⏱️继承默认</option>
+                        <option value="60" ${d.keepaliveInterval == 60 ? 'selected' : ''}>⏱️1分钟</option>
+                        <option value="180" ${d.keepaliveInterval == 180 ? 'selected' : ''}>⏱️3分钟</option>
                         <option value="300" ${d.keepaliveInterval == 300 ? 'selected' : ''}>⏱️5分钟</option>
                         <option value="600" ${d.keepaliveInterval == 600 ? 'selected' : ''}>⏱️10分钟</option>
                         <option value="900" ${d.keepaliveInterval == 900 ? 'selected' : ''}>⏱️15分钟</option>
@@ -1124,6 +1442,8 @@ function buildAccountCardElement(acc, slotIndex) {
                       <button type="button" class="pill-toggle-btn ${keepClass}" id="pill-keep-${acc.id}-${usid}" onclick="toggleVmFeature('${acc.id}', '${usid}', 'keepaliveEnabled', ${!isKeepaliveOn})" title="单台云电脑独立保活开关">⚡保活: ${keepText}</button>
                       <select class="pill-select" id="pill-interval-${acc.id}-${usid}" onchange="changeVmInterval('${acc.id}', '${usid}', this.value)" title="单台云电脑独立保活周期设置">
                         <option value="" ${!vm.keepaliveInterval ? 'selected' : ''}>⏱️继承默认</option>
+                        <option value="60" ${vm.keepaliveInterval == 60 ? 'selected' : ''}>⏱️1分钟</option>
+                        <option value="180" ${vm.keepaliveInterval == 180 ? 'selected' : ''}>⏱️3分钟</option>
                         <option value="300" ${vm.keepaliveInterval == 300 ? 'selected' : ''}>⏱️5分钟</option>
                         <option value="600" ${vm.keepaliveInterval == 600 ? 'selected' : ''}>⏱️10分钟</option>
                         <option value="900" ${vm.keepaliveInterval == 900 ? 'selected' : ''}>⏱️15分钟</option>
@@ -1314,7 +1634,8 @@ function buildAccountCardElement(acc, slotIndex) {
           <div style="display: flex; flex-direction: column; gap: 6px;">
             ${dList.map(d => {
               const idText = d.desktopCode || d.desktopId || d.objId || '主设备';
-              const isRunning = (d.useStatusText || '').includes('运行') || d.useStatus === 1 || d.useStatus === 0;
+              const ctyunPower = getCtyunPowerBadgeInfo(d);
+              const isRunning = ctyunPower.powerState === 'on';
               // 前端规格解析 (完全对齐 ctyun-pro parseDesktopSpec 策略)
               const flavor = d.flavorName || '';
               const name = d.desktopName || '';
@@ -1346,6 +1667,8 @@ function buildAccountCardElement(acc, slotIndex) {
               const specSuffix = ` · ${cpuClean}核/${memClean}G`;
               const isKeepaliveOn = d.keepaliveEnabled !== false;
               const isTaskOn = d.taskEnabled !== false;
+              const isAutoBootOn = d.autoBootEnabled !== false;
+              const isGlobalAutoBootOff = f.autoBoot === false;
               const targetId = String(d.desktopId || d.objId || idText);
 
               let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
@@ -1362,6 +1685,13 @@ function buildAccountCardElement(acc, slotIndex) {
                 taskText = '待命(总关)';
               }
 
+              let autoBootClass = isAutoBootOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
+              let autoBootText = isAutoBootOn ? '开' : '关';
+              if (isGlobalAutoBootOff && isAutoBootOn) {
+                autoBootClass = 'pill-paused';
+                autoBootText = '待命(总关)';
+              }
+
               return `
                 <div class="vm-device-item" id="desktop-item-${acc.id}-${targetId}">
                   <div class="vm-device-header">
@@ -1373,7 +1703,7 @@ function buildAccountCardElement(acc, slotIndex) {
                       <span style="font-size: 11px; color: #64748b; margin-top: 1px; text-overflow: ellipsis; overflow: hidden; white-space: nowrap;" title="设备ID: ${escapeHtml(idText)}${escapeHtml(specSuffix)}">ID: ${escapeHtml(idText)}${escapeHtml(specSuffix)}</span>
                     </div>
                     <div style="display: flex; align-items: center; gap: 6px; flex-shrink: 0; white-space: nowrap;">
-                      <span class="badge ${isRunning ? 'badge-online' : 'badge-offline'}">${isRunning ? '运行中' : '已关机'}</span>
+                      <span id="ctyun-power-badge-${acc.id}-${targetId}" class="badge ${ctyunPower.badgeClass}" style="${ctyunPower.badgeStyle}" title="${escapeHtml(ctyunPower.title)}">${escapeHtml(ctyunPower.label)}</span>
                       <button class="btn btn-sm btn-primary" style="padding: 2px 7px; font-size: 11px; flex-shrink: 0; white-space: nowrap;" onclick="launchWebDesktop('${acc.id}', '${d.desktopId || d.objId}')">🚀 打开</button>
                     </div>
                   </div>
@@ -1381,17 +1711,21 @@ function buildAccountCardElement(acc, slotIndex) {
                     <div class="pill-btn-group">
                       <button type="button" class="pill-toggle-btn ${keepClass}" id="pill-keep-${acc.id}-${targetId}" onclick="toggleVmFeature('${acc.id}', '${targetId}', 'keepaliveEnabled', ${!isKeepaliveOn})" title="单台云电脑独立保活开关 (脉冲长连保活)">⚡保活: ${keepText}</button>
                       <button type="button" class="pill-toggle-btn ${taskClass}" id="pill-task-${acc.id}-${targetId}" onclick="toggleVmFeature('${acc.id}', '${targetId}', 'taskEnabled', ${!isTaskOn})" title="单台云电脑独立任务开关 (控制打卡/AI对话/1小时挂机任务)">🎯任务: ${taskText}</button>
-                      <select class="pill-select" id="pill-interval-${acc.id}-${targetId}" onchange="changeVmInterval('${acc.id}', '${targetId}', this.value)" title="单台云电脑独立脉冲周期设置">
+                      <button type="button" class="pill-toggle-btn ${autoBootClass}" id="pill-autoboot-${acc.id}-${targetId}" onclick="toggleVmFeature('${acc.id}', '${targetId}', 'autoBootEnabled', ${!isAutoBootOn})" title="单台天翼云电脑自动开机守护（休眠自动唤醒 / 关机自动拉起，10 分钟冷却）">🛡️守护: ${autoBootText}</button>
+                      <select class="pill-select" id="pill-interval-${acc.id}-${targetId}" onchange="changeVmInterval('${acc.id}', '${targetId}', this.value)" title="单台天翼云电脑自定义保活间隔">
                         <option value="" ${!d.keepaliveInterval ? 'selected' : ''}>⏱️继承默认</option>
-                        <option value="15" ${d.keepaliveInterval == 15 ? 'selected' : ''}>⏱️15s脉冲</option>
-                        <option value="30" ${d.keepaliveInterval == 30 ? 'selected' : ''}>⏱️30s脉冲</option>
-                        <option value="60" ${d.keepaliveInterval == 60 ? 'selected' : ''}>⏱️1分钟脉冲</option>
-                        <option value="120" ${d.keepaliveInterval == 120 ? 'selected' : ''}>⏱️2分钟脉冲</option>
-                        <option value="300" ${d.keepaliveInterval == 300 ? 'selected' : ''}>⏱️5分钟脉冲</option>
+                        <option value="30" ${d.keepaliveInterval == 30 ? 'selected' : ''}>⏱️30s</option>
+                        <option value="60" ${d.keepaliveInterval == 60 ? 'selected' : ''}>⏱️1分钟</option>
+                        <option value="180" ${d.keepaliveInterval == 180 ? 'selected' : ''}>⏱️3分钟</option>
+                        <option value="300" ${d.keepaliveInterval == 300 ? 'selected' : ''}>⏱️5分钟</option>
+                        <option value="600" ${d.keepaliveInterval == 600 ? 'selected' : ''}>⏱️10分钟</option>
+                        <option value="900" ${d.keepaliveInterval == 900 ? 'selected' : ''}>⏱️15分钟</option>
+                        <option value="1800" ${d.keepaliveInterval == 1800 ? 'selected' : ''}>⏱️30分钟</option>
                       </select>
+                      <button type="button" class="pill-toggle-btn ${(d.customCron && d.customCron.enabled) ? 'pill-on-task' : 'pill-off-task'}" id="pill-cron-${acc.id}-${targetId}" onclick="openCtyunDesktopCronModal('${acc.id}', '${targetId}')" title="${(d.customCron && d.customCron.enabled) ? escapeHtml(`已启用单机自定义 Cron：签到=${d.customCron.signCron || '继承'} / AI=${d.customCron.aiChatCron || '继承'} / 挂机=${d.customCron.cloudHangCron || '继承'} / 兑换=${d.customCron.redeemCron || '继承'}`) : '为此台天翼云电脑独立配置任务 Cron 规则'}">⏰${(d.customCron && d.customCron.enabled) ? '定时:已配' : '定时规则'}</button>
                     </div>
                     <div style="display: flex; gap: 4px; align-items: center;">
-                      ${!isRunning ? `<button type="button" class="pill-toggle-btn pill-action-boot" onclick="bootCtyunVm('${acc.id}', '${targetId}')" title="单独对此台天翼云电脑下发开机">🖥️ 开机</button>` : ''}
+                      ${!isRunning ? `<button type="button" class="pill-toggle-btn pill-action-boot" onclick="bootCtyunVm('${acc.id}', '${targetId}')" title="单独对此台天翼云电脑下发开机/唤醒">🖥️ 开机</button>` : ''}
                     </div>
                   </div>
                 </div>
@@ -1450,7 +1784,7 @@ function buildAccountCardElement(acc, slotIndex) {
           <span style="flex-shrink: 0; font-size: 11.5px; color: #64748b;">当前动作:</span>
           <span id="acc-hb-text-${acc.id}" title="${escapeHtml(m.lastHeartbeatResult || '正在建立心跳通道...')}" style="font-size: 11.5px; color: ${(m.lastHeartbeatResult || '').includes('避让') ? '#d97706' : '#16a34a'}; font-weight: 600; text-overflow: ellipsis; overflow: hidden; white-space: nowrap; flex: 1; min-width: 0; cursor: help;">${escapeHtml(m.lastHeartbeatResult || '正在建立心跳通道...')}</span>
         </div>
-        <div style="font-size: 11.5px; color: #475569;">当日成功轮次: <span id="acc-success-count-${acc.id}" style="color: #2563eb; font-weight: 600;">${m.successCount || 0} 轮</span></div>
+        <div style="font-size: 11.5px; color: #475569; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" title="${escapeHtml(`累计休眠 ${m.sleepCount || 0} 次 · 掉线/关机 ${m.offlineCount || 0} 次${m.lastHealAt ? ` · 最近自愈(${m.lastHealReason || '恢复'}): ${m.lastHealAt}` : ''}`)}">当日成功: <span id="acc-success-count-${acc.id}" style="color: #2563eb; font-weight: 600;">${m.successCount || 0} 轮</span> · 自愈: <span id="acc-heal-count-${acc.id}" style="color: ${(m.healCount || 0) > 0 ? '#16a34a' : '#0f172a'}; font-weight: 600;">${m.healCount || 0} 次</span>${m.lastHealAt ? ` <span id="acc-heal-last-${acc.id}" style="color:#64748b;">(${escapeHtml(m.lastHealReason || '已恢复')} ${escapeHtml(String(m.lastHealAt).slice(5, 16))})</span>` : `<span id="acc-heal-last-${acc.id}" style="color:#64748b;"></span>`}</div>
       </div>
     </div>
 
@@ -1472,6 +1806,13 @@ function buildAccountCardElement(acc, slotIndex) {
         <span style="font-size: 11px; color: var(--text-muted); font-weight: normal; flex-shrink: 0; white-space: nowrap;">点击收起/展开</span>
       </summary>
       <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+        <div class="feature-row">
+          <span title="检测到云电脑休眠自动唤醒(awake)、关机自动拉起(poweron)；账号级 + 单机双开关，同机 10 分钟冷却，人工关机不拉起">🛡️ 自动开机守护</span>
+          <label class="switch">
+            <input type="checkbox" ${f.autoBoot !== false ? 'checked' : ''} onchange="toggleFeature('${acc.id}', 'autoBoot', this.checked)">
+            <span class="slider"></span>
+          </label>
+        </div>
         <div class="feature-row">
           <span>📡 启用云电脑保活</span>
           <label class="switch">
@@ -1501,8 +1842,8 @@ function buildAccountCardElement(acc, slotIndex) {
           </label>
         </div>
         <div class="feature-row">
-          <span>🎁 自动兑换/抽奖 (${acc.redeemConfig?.enabled ? '<b style=\"color:#16a34a\">已开</b>' : '未开'})</span>
-          <button class="btn btn-sm btn-warning" onclick="openRedeemModal('${acc.id}')" style="flex-shrink:0;padding:3px 8px;font-size:11.5px;">⚙️ 奖品设置</button>
+          <span>🎁 积分自动兑换 (${acc.redeemConfig?.enabled ? '<b style=\"color:#16a34a\">已开</b>' : '未开'})</span>
+          <button class="btn btn-sm btn-warning" onclick="openRedeemModal('${acc.id}')" style="flex-shrink:0;padding:3px 8px;font-size:11.5px;">⚙️ 兑换设置</button>
         </div>
       </div>
     </details>
@@ -1518,7 +1859,7 @@ function buildAccountCardElement(acc, slotIndex) {
       <div class="card-action-tools">
         <button class="btn btn-tool" onclick="syncAccountTasks('${acc.id}')" title="一键极速执行今日全部任务 (打卡/AI对话/挂机)">🔄 一键同步任务</button>
         <button class="btn btn-tool" onclick="openPowerModal('${acc.id}')" title="云电脑电源管理 (开机/重启/关机)">⚡ 电源管理</button>
-        <button class="btn btn-tool" onclick="openManualRedeemModal('${acc.id}')" title="根据当前积分手动兑换商品或抽奖">🎁 积分商城</button>
+        <button class="btn btn-tool" onclick="openManualRedeemModal('${acc.id}')" title="根据当前积分手动兑换天翼云商城商品">🎁 积分商城</button>
       </div>
       ${!acc.bound ? `<button class="btn btn-sm btn-warning" style="width:100%;margin-top:2px;" onclick="openSmsModal('${acc.id}')">📲 短信二次安全绑定</button>` : ''}
     </div>
@@ -1535,6 +1876,7 @@ function updateAccountsInPlace(filteredAccounts) {
 
     const isYdpc = acc.platform === 'ydpc';
     const isEcloud = acc.platform === 'ecloud';
+    const isTeleagent = acc.platform === 'teleagent';
     const m = acc.liveMetrics || {};
     const f = acc.features || {};
 
@@ -1542,8 +1884,8 @@ function updateAccountsInPlace(filteredAccounts) {
     //    原先在此处就地覆写该徽章元素的整段逻辑一并移除（元素已不存在，保留即死代码）。
     //    在线口径改由日志流承载；卡片上的监视板块改为可折叠标题。
 
-    // 2. 更新心跳/动作文本（天翼云：账号级单行；移动两平台走下方按主机渲染）
-    if (!isYdpc && !isEcloud) {
+    // 2. 更新心跳/动作文本（天翼云：账号级单行；其余平台走下方按主机渲染）
+    if (!isYdpc && !isEcloud && !isTeleagent) {
       const hbTextEl = document.getElementById(`acc-hb-text-${acc.id}`);
       if (hbTextEl) {
         const hbResult = m.lastHeartbeatResult || '正在建立心跳通道...';
@@ -1579,6 +1921,41 @@ function updateAccountsInPlace(filteredAccounts) {
       }
     }
 
+    // 2d. 天翼星辰（TeleAgent）逐台刷新与积分/签到徽章原地更新
+    if (isTeleagent) {
+      const taMonEl = document.getElementById(`acc-ta-mon-actions-${acc.id}`);
+      if (taMonEl) taMonEl.innerHTML = buildTeleagentDesktopMonitorHtml(acc);
+      const taPtsEl = document.getElementById(`acc-ta-points-${acc.id}`);
+      if (taPtsEl && m.points !== null && m.points !== undefined) {
+        taPtsEl.innerText = String(m.points);
+      }
+      const taSignEl = document.getElementById(`acc-ta-sign-${acc.id}`);
+      if (taSignEl) {
+        taSignEl.className = `badge ${m.signedToday ? 'badge-online' : 'badge-offline'}`;
+        taSignEl.innerText = m.signedToday ? '✅ 今日已签到' : '⏳ 今日未签到';
+      }
+      const taCronBtn = document.getElementById(`ta-sign-cron-btn-${acc.id}`);
+      if (taCronBtn) {
+        const hasTaCron = !!(acc.customCron && acc.customCron.enabled && acc.customCron.signCron);
+        taCronBtn.className = `pill-toggle-btn ${hasTaCron ? 'pill-on-task' : 'pill-off-task'}`;
+        taCronBtn.innerText = `⏰${hasTaCron ? '定时:已配' : '定时规则'}`;
+        taCronBtn.title = hasTaCron ? `已启用独立积分签到 Cron：${acc.customCron.signCron}` : '为 TeleAgent 每日积分任务配置独立 Cron 触发器（留空继承全局）';
+      }
+      const activeInfoEl = document.getElementById(`acc-active-info-${acc.id}`);
+      if (activeInfoEl) {
+        activeInfoEl.innerHTML = `账号汇总: <b style="color: #0f172a;">今日 ${m.successCount || 0} 轮 · 心跳 ${m.heartbeats || 0} 次 · 自愈 ${m.healCount || 0} 次</b> · 周期: <b>${buildIntervalOverviewText(acc)}</b>`;
+      }
+      for (const d of (acc.desktops || [])) {
+        const iid2 = String(d.instanceId || d.id || '');
+        const pAuto = document.getElementById(`pill-autoboot-${acc.id}-${iid2}`);
+        if (pAuto) {
+          const on = d.autoBootEnabled !== false;
+          pAuto.className = `pill-toggle-btn ${on ? 'pill-on-keepalive' : 'pill-off-keepalive'}`;
+          pAuto.innerText = `🛡️守护: ${on ? '开' : '关'}`;
+        }
+      }
+    }
+
     // 3. 更新倒计时与轮次 (天翼云)
     const cdEl = document.getElementById(`acc-countdown-${acc.id}`);
     if (cdEl) {
@@ -1590,6 +1967,15 @@ function updateAccountsInPlace(filteredAccounts) {
     const successEl = document.getElementById(`acc-success-count-${acc.id}`);
     if (successEl) {
       successEl.innerText = `${m.successCount || 0} 轮`;
+    }
+    const healEl = document.getElementById(`acc-heal-count-${acc.id}`);
+    if (healEl) {
+      healEl.innerText = `${m.healCount || 0} 次`;
+      healEl.style.color = (m.healCount || 0) > 0 ? '#16a34a' : '#0f172a';
+    }
+    const healLastEl = document.getElementById(`acc-heal-last-${acc.id}`);
+    if (healLastEl) {
+      healLastEl.innerText = m.lastHealAt ? `(${m.lastHealReason || '已恢复'} ${String(m.lastHealAt).slice(5, 16)})` : '';
     }
 
     // 4. 更新移动两平台账号级汇总与周期概览（逐台状态已在 2b / 2c 刷新）
@@ -1709,7 +2095,43 @@ function updateAccountsInPlace(filteredAccounts) {
           pInterval.value = d.keepaliveInterval ? String(d.keepaliveInterval) : '';
         }
       });
-    } else if (!isYdpc && !isEcloud && acc.desktops) {
+    } else if (isTeleagent && acc.desktops) {
+      const isGlobalKeepAliveOff = f.keepAlive === false;
+      if (multiStatusEl) {
+        if (isGlobalKeepAliveOff) {
+          multiStatusEl.innerHTML = `<span style="color: #94a3b8; font-weight: 600;">⚪ 全局保活已关闭</span>`;
+        } else {
+          const anyKeepOn = acc.desktops.some(d => d.keepaliveEnabled !== false);
+          const allKeepOn = acc.desktops.every(d => d.keepaliveEnabled !== false);
+          if (allKeepOn && acc.desktops.length > 1) {
+            multiStatusEl.innerHTML = `<span style="color: #10b981; font-weight: 600;">🟢 全量多机保活已激活</span>`;
+          } else if (anyKeepOn) {
+            multiStatusEl.innerHTML = `<span style="color: #0284c7; font-weight: 600;">🟡 心跳+换票保活中</span>`;
+          } else {
+            multiStatusEl.innerHTML = `<span style="color: #94a3b8; font-weight: 600;">⚪ 单机保活已全关</span>`;
+          }
+        }
+      }
+      acc.desktops.forEach(d => {
+        const iid = String(d.instanceId || d.id || '');
+        const isKeepaliveOn = d.keepaliveEnabled !== false;
+        const pKeep = document.getElementById(`pill-keep-${acc.id}-${iid}`);
+        if (pKeep) {
+          let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
+          let keepText = isKeepaliveOn ? '开' : '关';
+          if (isGlobalKeepAliveOff && isKeepaliveOn) {
+            keepClass = 'pill-paused';
+            keepText = '待命(总关)';
+          }
+          pKeep.className = `pill-toggle-btn ${keepClass}`;
+          pKeep.innerText = `⚡保活: ${keepText}`;
+        }
+        const pInterval = document.getElementById(`pill-interval-${acc.id}-${iid}`);
+        if (pInterval && document.activeElement !== pInterval) {
+          pInterval.value = d.keepaliveInterval ? String(d.keepaliveInterval) : '';
+        }
+      });
+    } else if (!isYdpc && !isEcloud && !isTeleagent && acc.desktops) {
       const isGlobalKeepAliveOff = f.keepAlive === false;
       const isGlobalTasksOff = f.cloudHang === false && f.autoSign === false && f.aiChat === false;
 
@@ -1733,6 +2155,16 @@ function updateAccountsInPlace(filteredAccounts) {
         const targetId = String(d.desktopId || d.objId || d.desktopCode || '');
         const isKeepaliveOn = d.keepaliveEnabled !== false;
         const isTaskOn = d.taskEnabled !== false;
+        const isAutoBootOn = d.autoBootEnabled !== false;
+        const isGlobalAutoBootOff = f.autoBoot === false;
+        const pBadge = document.getElementById(`ctyun-power-badge-${acc.id}-${targetId}`);
+        if (pBadge) {
+          const info = getCtyunPowerBadgeInfo(d);
+          pBadge.className = `badge ${info.badgeClass}`;
+          pBadge.setAttribute('style', info.badgeStyle);
+          pBadge.title = info.title;
+          pBadge.innerText = info.label;
+        }
         const pKeep = document.getElementById(`pill-keep-${acc.id}-${targetId}`);
         if (pKeep) {
           let keepClass = isKeepaliveOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
@@ -1754,6 +2186,17 @@ function updateAccountsInPlace(filteredAccounts) {
           }
           pTask.className = `pill-toggle-btn ${taskClass}`;
           pTask.innerText = `🎯任务: ${taskText}`;
+        }
+        const pAutoBoot = document.getElementById(`pill-autoboot-${acc.id}-${targetId}`);
+        if (pAutoBoot) {
+          let abClass = isAutoBootOn ? 'pill-on-keepalive' : 'pill-off-keepalive';
+          let abText = isAutoBootOn ? '开' : '关';
+          if (isGlobalAutoBootOff && isAutoBootOn) {
+            abClass = 'pill-paused';
+            abText = '待命(总关)';
+          }
+          pAutoBoot.className = `pill-toggle-btn ${abClass}`;
+          pAutoBoot.innerText = `🛡️守护: ${abText}`;
         }
         const pInterval = document.getElementById(`pill-interval-${acc.id}-${targetId}`);
         if (pInterval && document.activeElement !== pInterval) {
@@ -1802,7 +2245,7 @@ function renderAccounts(isSilent = false) {
       activeAccountViewTab = 'all'; // 自动还原
     }
   }
-  const tabBtnMap = { ctyun: 'view-tab-ctyun', ydpc: 'view-tab-ydpc', ecloud: 'view-tab-ecloud' };
+  const tabBtnMap = { ctyun: 'view-tab-ctyun', ydpc: 'view-tab-ydpc', ecloud: 'view-tab-ecloud', teleagent: 'view-tab-teleagent' };
   for (const [pf, btnId] of Object.entries(tabBtnMap)) {
     const btn = document.getElementById(btnId);
     if (!btn) continue;
@@ -1815,7 +2258,7 @@ function renderAccounts(isSilent = false) {
   const filteredAccounts = getFilteredAccounts();
 
   if (!filteredAccounts || filteredAccounts.length === 0) {
-    const tabNameMap = { ydpc: '移动爱家', ctyun: '天翼云电脑', ecloud: '移动公众' };
+    const tabNameMap = { ydpc: '移动爱家', ctyun: '天翼云电脑', ecloud: '移动公众', teleagent: '天翼星辰' };
     const tabName = tabNameMap[activeAccountViewTab] || '云电脑';
     container.innerHTML = `
       <div style="grid-column: 1 / -1; text-align: center; padding: 40px; color: var(--text-muted); background: var(--bg-secondary); border-radius: var(--radius); border: 1px dashed var(--border);">
@@ -2140,6 +2583,7 @@ async function toggleVmFeature(accId, vmKey, featureName, nextVal) {
 
   const isYdpc = acc.platform === 'ydpc';
   const isEcloud = acc.platform === 'ecloud';
+  const isTeleagent = acc.platform === 'teleagent';
   if (isYdpc) {
     acc.vms = acc.vms || [];
     const targetVm = acc.vms.find(v => String(v.userServiceId) === String(vmKey));
@@ -2148,6 +2592,10 @@ async function toggleVmFeature(accId, vmKey, featureName, nextVal) {
     // 移动公众：单机主键为 instanceId（与 ydpc 的 userServiceId、天翼云的 desktopId 各自独立）
     acc.desktops = acc.desktops || [];
     const targetD = acc.desktops.find(d => String(d.instanceId) === String(vmKey));
+    if (targetD) targetD[featureName] = nextVal;
+  } else if (isTeleagent) {
+    acc.desktops = acc.desktops || [];
+    const targetD = acc.desktops.find(d => String(d.instanceId || d.id) === String(vmKey));
     if (targetD) targetD[featureName] = nextVal;
   } else {
     acc.desktops = acc.desktops || [];
@@ -2219,6 +2667,7 @@ async function changeVmInterval(accId, vmKey, value) {
 
   const isYdpc = acc.platform === 'ydpc';
   const isEcloud = acc.platform === 'ecloud';
+  const isTeleagent = acc.platform === 'teleagent';
   if (isYdpc) {
     acc.vms = acc.vms || [];
     const targetVm = acc.vms.find(v => String(v.userServiceId) === String(vmKey));
@@ -2226,6 +2675,10 @@ async function changeVmInterval(accId, vmKey, value) {
   } else if (isEcloud) {
     acc.desktops = acc.desktops || [];
     const targetD = acc.desktops.find(d => String(d.instanceId) === String(vmKey));
+    if (targetD) targetD.keepaliveInterval = finalVal;
+  } else if (isTeleagent) {
+    acc.desktops = acc.desktops || [];
+    const targetD = acc.desktops.find(d => String(d.instanceId || d.id) === String(vmKey));
     if (targetD) targetD.keepaliveInterval = finalVal;
   } else {
     acc.desktops = acc.desktops || [];
@@ -2243,7 +2696,7 @@ async function changeVmInterval(accId, vmKey, value) {
       body: JSON.stringify({ vmId: vmKey, desktopId: vmKey, feature: 'keepaliveInterval', value: finalVal })
     });
     if (res.ok) {
-      showToast(`已将该主机保活周期调整为: ${finalVal ? ((isYdpc || isEcloud) ? Math.round(finalVal / 60) + '分钟' : finalVal + '秒') : '继承账号默认'}`, "success");
+      showToast(`已将该主机保活周期调整为: ${finalVal ? ((isYdpc || isEcloud || isTeleagent) ? Math.round(finalVal / 60) + '分钟' : finalVal + '秒') : '继承账号默认'}`, "success");
     } else {
       const data = await res.json();
       showToast(data.error || "更新失败", "error");
@@ -2252,6 +2705,170 @@ async function changeVmInterval(accId, vmKey, value) {
   } catch (e) {
     showToast("网络请求异常: " + e.message, "error");
     await loadAccounts(true);
+  }
+}
+
+// 天翼云电脑统一运行状态徽章解析（与后端 CtYunClient.normalizePowerState 严格同口径）
+function getCtyunPowerBadgeInfo(d) {
+  const rawText = String(d?.useStatusText || '').trim();
+  const code = d?.useStatus;
+  let ps = String(d?.powerState || '').toLowerCase();
+  if (!['on', 'sleeping', 'starting', 'off', 'unknown'].includes(ps)) {
+    if (/启动|开机中|唤醒|重启|恢复中/.test(rawText)) ps = 'starting';
+    else if (/休眠|睡眠|挂起/.test(rawText)) ps = 'sleeping';
+    else if (/关机|停机|停止|已关|未启动|离线/.test(rawText)) ps = 'off';
+    else if (rawText.includes('运行') || code === 25 || String(code) === '25') ps = 'on';
+    else if (code === 0 || String(code) === '0') ps = 'off';
+    else ps = 'unknown';
+  }
+  if (ps === 'on') {
+    return { powerState: 'on', label: '运行中', badgeClass: 'badge-online', badgeStyle: '', title: `运行中 (原始状态: ${rawText || code || 'on'})` };
+  }
+  if (ps === 'sleeping') {
+    return { powerState: 'sleeping', label: rawText || '休眠中', badgeClass: '', badgeStyle: 'background:#f3e8ff;color:#7e22ce;border:1px solid #d8b4fe;', title: `休眠中 (守护开启时将自动调用 awake 唤醒)` };
+  }
+  if (ps === 'starting') {
+    return { powerState: 'starting', label: rawText || '启动中', badgeClass: '', badgeStyle: 'background:#fef3c7;color:#b45309;border:1px solid #fde68a;', title: `正在启动/唤醒中，等待就绪` };
+  }
+  if (ps === 'off') {
+    return { powerState: 'off', label: rawText || '已关机', badgeClass: 'badge-offline', badgeStyle: '', title: `已关机 (守护开启且非人工关机时将自动调用 poweron 拉起)` };
+  }
+  return { powerState: 'unknown', label: rawText || '状态未知', badgeClass: '', badgeStyle: 'background:#f1f5f9;color:#64748b;border:1px solid #cbd5e1;', title: `平台未返回明确状态` };
+}
+
+// 单台天翼云电脑自定义任务 Cron 规则独立弹窗（不在编辑账号/重新验证弹窗内）
+function toggleCtyunDesktopCronInputs(enabled) {
+  const box = document.getElementById("ctyun-dcron-inputs");
+  if (!box) return;
+  box.style.opacity = enabled ? "1" : "0.55";
+  box.querySelectorAll("input").forEach((el) => { el.disabled = !enabled; });
+}
+
+function openCtyunDesktopCronModal(accId, desktopId) {
+  const acc = accounts.find(a => a.id === accId);
+  if (!acc) return;
+  const d = (acc.desktops || acc.liveMetrics?.desktops || []).find(item => String(item.desktopId || item.objId) === String(desktopId));
+  if (!d) {
+    showToast("未找到目标云电脑信息，请刷新后重试", "error");
+    return;
+  }
+  const cc = d.customCron || {};
+  document.getElementById("ctyun-dcron-acc-id").value = accId;
+  document.getElementById("ctyun-dcron-desktop-id").value = String(desktopId);
+  const nameEl = document.getElementById("ctyun-dcron-desktop-name");
+  if (nameEl) nameEl.innerText = `${d.desktopName || '天翼云电脑'} (${desktopId})`;
+  const enEl = document.getElementById("ctyun-dcron-enabled");
+  if (enEl) enEl.checked = !!cc.enabled;
+  const sEl = document.getElementById("ctyun-dcron-sign");
+  const aEl = document.getElementById("ctyun-dcron-aichat");
+  const hEl = document.getElementById("ctyun-dcron-hang");
+  const rEl = document.getElementById("ctyun-dcron-redeem");
+  if (sEl) sEl.value = cc.signCron || "";
+  if (aEl) aEl.value = cc.aiChatCron || "";
+  if (hEl) hEl.value = cc.cloudHangCron || "";
+  if (rEl) rEl.value = cc.redeemCron || "";
+  toggleCtyunDesktopCronInputs(!!cc.enabled);
+  openModal("ctyun-desktop-cron-modal");
+}
+
+async function saveCtyunDesktopCron() {
+  const accId = document.getElementById("ctyun-dcron-acc-id").value;
+  const desktopId = document.getElementById("ctyun-dcron-desktop-id").value;
+  const payload = {
+    enabled: !!document.getElementById("ctyun-dcron-enabled")?.checked,
+    signCron: (document.getElementById("ctyun-dcron-sign")?.value || "").trim(),
+    aiChatCron: (document.getElementById("ctyun-dcron-aichat")?.value || "").trim(),
+    cloudHangCron: (document.getElementById("ctyun-dcron-hang")?.value || "").trim(),
+    redeemCron: (document.getElementById("ctyun-dcron-redeem")?.value || "").trim(),
+  };
+
+  for (const [label, expr] of [['签到打卡', payload.signCron], ['AI 对话', payload.aiChatCron], ['云电脑挂机', payload.cloudHangCron], ['自动兑换', payload.redeemCron]]) {
+    if (expr && expr.split(/\s+/).length !== 5) {
+      showToast(`Cron 格式错误：【${label}】必须为 5 段标准表达式（例如 0 2 * * *）`, "error");
+      return;
+    }
+  }
+
+  try {
+    const res = await authFetch(`/api/accounts/${accId}/vm-feature`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ desktopId, feature: "customCron", value: payload })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) {
+      showToast(payload.enabled ? "⏰ 单台云电脑自定义 Cron 规则已保存并生效！" : "已切换为继承全局调度规则", "success");
+      closeModal("ctyun-desktop-cron-modal");
+      await loadAccounts(true);
+    } else {
+      showToast(data.error || "保存单机 Cron 规则失败", "error");
+    }
+  } catch (e) {
+    showToast("网络请求异常: " + e.message, "error");
+  }
+}
+
+// 天翼星辰（TeleAgent）每日积分任务独立触发器弹窗
+function toggleTeleagentSignCronInputs(enabled) {
+  const box = document.getElementById("ta-scron-inputs");
+  if (!box) return;
+  box.style.opacity = enabled ? "1" : "0.55";
+  box.querySelectorAll("input, button").forEach((el) => { el.disabled = !enabled; });
+}
+
+function applyTeleagentSignCronPreset(expr) {
+  const enEl = document.getElementById("ta-scron-enabled");
+  const exprEl = document.getElementById("ta-scron-expr");
+  if (enEl && !enEl.checked) {
+    enEl.checked = true;
+    toggleTeleagentSignCronInputs(true);
+  }
+  if (exprEl) exprEl.value = expr;
+}
+
+function openTeleagentSignCronModal(accId) {
+  const acc = accounts.find(a => a.id === accId);
+  if (!acc) return;
+  const cc = acc.customCron || {};
+  document.getElementById("ta-scron-acc-id").value = accId;
+  const nameEl = document.getElementById("ta-scron-acc-name");
+  if (nameEl) nameEl.innerText = acc.name || acc.user || accId;
+  const enEl = document.getElementById("ta-scron-enabled");
+  if (enEl) enEl.checked = !!cc.enabled;
+  const exprEl = document.getElementById("ta-scron-expr");
+  if (exprEl) exprEl.value = cc.signCron || "";
+  toggleTeleagentSignCronInputs(!!cc.enabled);
+  openModal("teleagent-sign-cron-modal");
+}
+
+async function saveTeleagentSignCron() {
+  const accId = document.getElementById("ta-scron-acc-id").value;
+  const enabled = !!document.getElementById("ta-scron-enabled")?.checked;
+  const signCron = (document.getElementById("ta-scron-expr")?.value || "").trim().replace(/\s+/g, " ");
+  if (signCron && signCron.split(" ").length !== 5) {
+    showToast("Cron 格式错误：每日积分签到 Cron 必须为 5 段标准表达式（例如 15 8 * * *）", "error");
+    return;
+  }
+  if (enabled && !signCron) {
+    showToast("请填写 5 段标准 Cron 表达式，或关闭独立触发器以继承全局调度", "error");
+    return;
+  }
+  try {
+    const res = await authFetch(`/api/accounts/${accId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ customCron: { enabled, signCron } })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      showToast(enabled ? `⏰ 天翼星辰积分任务独立触发器已保存 (${signCron})` : "已切换为继承全局调度规则", "success");
+      closeModal("teleagent-sign-cron-modal");
+      await loadAccounts(true);
+    } else {
+      showToast(data.error || "保存触发器失败", "error");
+    }
+  } catch (e) {
+    showToast("网络请求异常: " + e.message, "error");
   }
 }
 
@@ -2306,6 +2923,35 @@ async function refreshModalCaptcha() {
   }
 }
 
+function resetCtyunQrPlaceholder() {
+  if (qrPollingTimer) { clearInterval(qrPollingTimer); qrPollingTimer = null; }
+  currentQrCodeId = '';
+  const imgEl = document.getElementById("acc-qrcode-img");
+  const loadingEl = document.getElementById("acc-qrcode-loading");
+  const hintEl = document.getElementById("acc-qrcode-hint");
+  const btnEl = document.getElementById("btn-ctyun-get-qr");
+  if (imgEl) { imgEl.src = ""; imgEl.style.display = "none"; }
+  if (loadingEl) {
+    loadingEl.style.display = "flex";
+    loadingEl.innerHTML = `<span>点击下方按钮获取官方登录二维码</span>`;
+  }
+  if (hintEl) {
+    hintEl.innerText = "请先点击上方按钮获取二维码后再扫码登录";
+    hintEl.style.color = "var(--text-muted)";
+  }
+  if (btnEl) { btnEl.disabled = false; btnEl.innerText = "📱 获取登录二维码"; }
+}
+
+function resetCtyunCaptchaPlaceholder() {
+  const imgEl = document.getElementById("acc-captcha-img");
+  const loadingEl = document.getElementById("acc-captcha-loading");
+  if (imgEl) { imgEl.src = ""; imgEl.style.display = "none"; }
+  if (loadingEl) {
+    loadingEl.style.display = "inline";
+    loadingEl.innerText = "点击获取验证码";
+  }
+}
+
 function switchAccountLoginTab(tab) {
   const btnQr = document.getElementById("tab-btn-qrcode");
   const btnPwd = document.getElementById("tab-btn-pwd");
@@ -2319,7 +2965,8 @@ function switchAccountLoginTab(tab) {
     if (panelQr) panelQr.classList.remove("hidden");
     if (panelPwd) panelPwd.classList.add("hidden");
     if (btnSave) btnSave.style.display = "none";
-    loadQrCodeForModal();
+    // 不自动触发二维码请求，等待用户手动点击「获取登录二维码」按钮
+    resetCtyunQrPlaceholder();
   } else {
     if (btnQr) { btnQr.className = "btn btn-sm"; }
     if (btnPwd) { btnPwd.className = "btn btn-sm btn-primary"; }
@@ -2327,7 +2974,8 @@ function switchAccountLoginTab(tab) {
     if (panelPwd) panelPwd.classList.remove("hidden");
     if (btnSave) btnSave.style.display = "inline-block";
     if (qrPollingTimer) { clearInterval(qrPollingTimer); qrPollingTimer = null; }
-    setTimeout(refreshModalCaptcha, 200);
+    // 与移动爱家一致：不自动拉取图形验证码，由用户手动点击验证码框获取
+    resetCtyunCaptchaPlaceholder();
   }
 }
 
@@ -2433,6 +3081,24 @@ function openAddAccountModal() {
   if (ecInterval) ecInterval.value = "300";
   resetEcloudSmsGroup();
 
+  // 天翼星辰（TeleAgent）：清空表单字段并默认推荐扫码登录（不自动获取二维码）
+  const taName = document.getElementById("teleagent-name");
+  if (taName) taName.value = "";
+  const taUser = document.getElementById("teleagent-user");
+  if (taUser) taUser.value = "";
+  const taPwd = document.getElementById("teleagent-password");
+  if (taPwd) taPwd.value = "";
+  const taInterval = document.getElementById("teleagent-interval");
+  if (taInterval) taInterval.value = "300";
+  const taReloginDays = document.getElementById("teleagent-relogin-days");
+  if (taReloginDays) taReloginDays.value = "7";
+  const taQrName = document.getElementById("ta-qr-name");
+  if (taQrName) taQrName.value = "";
+  const taQrInterval = document.getElementById("ta-qr-interval");
+  if (taQrInterval) taQrInterval.value = "300";
+  resetTeleagentQrPlaceholder();
+  switchTeleagentLoginTab('qr');
+
   const platformTabs = document.getElementById("platform-tabs-container");
   if (platformTabs) platformTabs.style.display = "flex";
 
@@ -2477,26 +3143,45 @@ function switchAddAccountPlatform(platform) {
   const tabCt = document.getElementById("platform-tab-ctyun");
   const tabYd = document.getElementById("platform-tab-ydpc");
   const tabEc = document.getElementById("platform-tab-ecloud");
+  const tabTa = document.getElementById("platform-tab-teleagent");
   const panelCt = document.getElementById("panel-add-ctyun");
   const panelYd = document.getElementById("panel-add-ydpc");
   const panelEc = document.getElementById("panel-add-ecloud");
+  const panelTa = document.getElementById("panel-add-teleagent");
   const btnSaveCt = document.getElementById("btn-save-account-pwd");
   const btnSaveYd = document.getElementById("btn-save-account-ydpc");
   const btnSaveEc = document.getElementById("btn-save-account-ecloud");
+  const btnSaveTa = document.getElementById("btn-save-account-teleagent");
   const loginTabs = document.getElementById("acc-login-tabs");
   const modalTitle = document.getElementById("modal-account-title");
   const isNew = !document.getElementById("acc-id").value;
 
-  // 先统一收起全部面板/按钮，再按平台单独展开（三平台各自独立，不互相污染）
+  // 先统一收起全部面板/按钮，再按平台单独展开（四平台各自独立，不互相污染）
   if (tabCt) tabCt.className = "btn btn-sm";
   if (tabYd) tabYd.className = "btn btn-sm";
   if (tabEc) tabEc.className = "btn btn-sm";
+  if (tabTa) tabTa.className = "btn btn-sm";
   if (panelCt) panelCt.classList.add("hidden");
   if (panelYd) panelYd.classList.add("hidden");
   if (panelEc) panelEc.classList.add("hidden");
+  if (panelTa) panelTa.classList.add("hidden");
   if (btnSaveCt) btnSaveCt.style.display = "none";
   if (btnSaveYd) btnSaveYd.style.display = "none";
   if (btnSaveEc) btnSaveEc.style.display = "none";
+  if (btnSaveTa) btnSaveTa.style.display = "none";
+
+  if (platform === 'teleagent') {
+    if (tabTa) tabTa.className = "btn btn-sm btn-primary";
+    if (panelTa) panelTa.classList.remove("hidden");
+    if (modalTitle && isNew) modalTitle.innerText = "添加天翼星辰 (TeleAgent) 账号";
+    if (loginTabs) loginTabs.style.display = "none";
+    if (qrPollingTimer) { clearInterval(qrPollingTimer); qrPollingTimer = null; }
+    if (isNew) {
+      // 默认推荐扫码登录，但需手动点击按钮才获取二维码
+      switchTeleagentLoginTab('qr');
+    }
+    return;
+  }
 
   if (platform === 'ydpc') {
     if (tabYd) tabYd.className = "btn btn-sm btn-primary";
@@ -2505,6 +3190,7 @@ function switchAddAccountPlatform(platform) {
     if (modalTitle) modalTitle.innerText = "添加移动爱家账号";
     if (loginTabs) loginTabs.style.display = "none";
     if (qrPollingTimer) { clearInterval(qrPollingTimer); qrPollingTimer = null; }
+    if (taQrPollingTimer) { clearInterval(taQrPollingTimer); taQrPollingTimer = null; }
     return;
   }
 
@@ -2517,10 +3203,12 @@ function switchAddAccountPlatform(platform) {
     if (modalTitle) modalTitle.innerText = pendingEcloudLogin ? "移动公众账号 · 短信验证" : "添加移动公众账号";
     if (loginTabs) loginTabs.style.display = "none";
     if (qrPollingTimer) { clearInterval(qrPollingTimer); qrPollingTimer = null; }
+    if (taQrPollingTimer) { clearInterval(taQrPollingTimer); taQrPollingTimer = null; }
     return;
   }
 
   // 天翼云
+  if (taQrPollingTimer) { clearInterval(taQrPollingTimer); taQrPollingTimer = null; }
   if (tabCt) tabCt.className = "btn btn-sm btn-primary";
   if (panelCt) panelCt.classList.remove("hidden");
   if (modalTitle && isNew) modalTitle.innerText = "添加天翼云电脑账号";
@@ -2870,6 +3558,293 @@ async function syncEcloudDesktops(accId) {
   await loadAccounts(true);
 }
 
+// ====================================================
+// 🌟 天翼星辰（TeleAgent）：扫码 / 账密登录 / 保活 / 签到 / 开机 / 打开云电脑
+// ====================================================
+function resetTeleagentQrPlaceholder() {
+  if (taQrPollingTimer) { clearInterval(taQrPollingTimer); taQrPollingTimer = null; }
+  currentTaQrId = '';
+  const imgEl = document.getElementById("ta-qrcode-img");
+  const loadingEl = document.getElementById("ta-qrcode-loading");
+  const hintEl = document.getElementById("ta-qrcode-hint");
+  const btnEl = document.getElementById("btn-ta-get-qr");
+  if (imgEl) { imgEl.src = ""; imgEl.style.display = "none"; }
+  if (loadingEl) {
+    loadingEl.style.display = "flex";
+    loadingEl.innerHTML = `<span>点击下方按钮获取天翼星辰官方二维码</span>`;
+  }
+  if (hintEl) {
+    hintEl.innerText = "请先点击上方按钮获取二维码后再扫码授权";
+    hintEl.style.color = "var(--text-muted)";
+  }
+  if (btnEl) { btnEl.disabled = false; btnEl.innerText = "📱 获取登录二维码"; }
+}
+
+function switchTeleagentLoginTab(tab) {
+  const btnPwd = document.getElementById("ta-tab-btn-pwd");
+  const btnQr = document.getElementById("ta-tab-btn-qr");
+  const panelPwd = document.getElementById("ta-login-panel-pwd");
+  const panelQr = document.getElementById("ta-login-panel-qr");
+  const saveBtn = document.getElementById("btn-save-account-teleagent");
+
+  if (tab === 'qr') {
+    if (btnPwd) btnPwd.className = "btn btn-sm";
+    if (btnQr) btnQr.className = "btn btn-sm btn-primary";
+    if (panelPwd) panelPwd.classList.add("hidden");
+    if (panelQr) panelQr.classList.remove("hidden");
+    if (saveBtn) saveBtn.style.display = "none";
+    // 不自动触发二维码请求，等待用户手动点击「获取登录二维码」
+    resetTeleagentQrPlaceholder();
+  } else {
+    if (btnPwd) btnPwd.className = "btn btn-sm btn-primary";
+    if (btnQr) btnQr.className = "btn btn-sm";
+    if (panelPwd) panelPwd.classList.remove("hidden");
+    if (panelQr) panelQr.classList.add("hidden");
+    if (taQrPollingTimer) { clearInterval(taQrPollingTimer); taQrPollingTimer = null; }
+    if (saveBtn && currentAddPlatform === 'teleagent') saveBtn.style.display = "inline-block";
+  }
+}
+
+async function loadTeleagentQrCode() {
+  if (taQrPollingTimer) { clearInterval(taQrPollingTimer); taQrPollingTimer = null; }
+  const imgEl = document.getElementById("ta-qrcode-img");
+  const loadingEl = document.getElementById("ta-qrcode-loading");
+  const hintEl = document.getElementById("ta-qrcode-hint");
+  const btnEl = document.getElementById("btn-ta-get-qr");
+
+  if (btnEl) { btnEl.disabled = true; btnEl.innerText = "正在获取二维码..."; }
+  if (imgEl) imgEl.style.display = "none";
+  if (loadingEl) { loadingEl.style.display = "flex"; loadingEl.innerText = "正在向天翼账号中心申请官方二维码..."; }
+  if (hintEl) { hintEl.innerText = "请稍候..."; hintEl.style.color = "#2563eb"; }
+
+  try {
+    const res = await authFetch("/api/accounts/teleagent/qrcode/generate", { method: "POST" });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success && data.qrId && data.qrImage) {
+      currentTaQrId = data.qrId;
+      if (imgEl) {
+        imgEl.src = data.qrImage;
+        imgEl.style.display = "block";
+      }
+      if (loadingEl) loadingEl.style.display = "none";
+      if (hintEl) { hintEl.innerText = "请使用手机天翼账号 / 小翼管家 App 扫码并确认登录..."; hintEl.style.color = "#2563eb"; }
+      if (btnEl) { btnEl.disabled = false; btnEl.innerText = "🔄 刷新二维码"; }
+
+      const currentAccId = document.getElementById("acc-id") ? document.getElementById("acc-id").value : "";
+      taQrPollingTimer = setInterval(async () => {
+        if (!currentTaQrId) return;
+        try {
+          const nameVal = document.getElementById("ta-qr-name") ? document.getElementById("ta-qr-name").value.trim() : "";
+          const intVal = document.getElementById("ta-qr-interval") ? (parseInt(document.getElementById("ta-qr-interval").value, 10) || 300) : 300;
+          const qs = new URLSearchParams({
+            qrId: currentTaQrId,
+            name: nameVal,
+            keepaliveInterval: String(intVal),
+            ...(currentAccId ? { accId: currentAccId } : {})
+          });
+          const sRes = await authFetch(`/api/accounts/teleagent/qrcode/status?${qs.toString()}`);
+          const sData = await sRes.json().catch(() => ({}));
+          if (!sRes.ok && sData.error) {
+            clearInterval(taQrPollingTimer);
+            taQrPollingTimer = null;
+            if (hintEl) { hintEl.innerText = `❌ 授权失败: ${sData.error}`; hintEl.style.color = "#dc2626"; }
+            return;
+          }
+          if (sData.status === 'scanned') {
+            if (hintEl) { hintEl.innerText = "📱 手机端已扫描，请在手机上点击【确认登录】..."; hintEl.style.color = "#16a34a"; }
+          } else if (sData.status === 'authorized') {
+            clearInterval(taQrPollingTimer);
+            taQrPollingTimer = null;
+            showToast(sData.isReAuth ? "🎉 天翼星辰扫码重新授权成功！保活已恢复！" : "🎉 天翼星辰官方扫码登录成功！已自动启动保活守护！", "success");
+            closeModal("account-modal");
+            loadAccounts(true);
+          } else if (sData.status === 'expired') {
+            clearInterval(taQrPollingTimer);
+            taQrPollingTimer = null;
+            if (hintEl) { hintEl.innerText = "⚠️ 二维码已过期，请点击上方按钮重新获取"; hintEl.style.color = "#ef4444"; }
+            if (imgEl) imgEl.style.display = "none";
+            if (loadingEl) { loadingEl.style.display = "flex"; loadingEl.innerText = "二维码已过期"; }
+          }
+        } catch (e) {}
+      }, 2500);
+    } else {
+      if (loadingEl) loadingEl.innerText = "获取失败: " + (data.error || `HTTP ${res.status}`);
+      if (hintEl) { hintEl.innerText = "获取二维码失败，请点击上方按钮重试"; hintEl.style.color = "#ef4444"; }
+      if (btnEl) { btnEl.disabled = false; btnEl.innerText = "🔄 重新获取二维码"; }
+    }
+  } catch (e) {
+    if (loadingEl) loadingEl.innerText = "网络异常: " + e.message;
+    if (hintEl) { hintEl.innerText = "网络异常，请重试"; hintEl.style.color = "#ef4444"; }
+    if (btnEl) { btnEl.disabled = false; btnEl.innerText = "🔄 重新获取二维码"; }
+  }
+}
+
+async function saveTeleagentAccount() {
+  const accId = document.getElementById("acc-id") ? document.getElementById("acc-id").value : "";
+  const name = document.getElementById("teleagent-name") ? document.getElementById("teleagent-name").value.trim() : "";
+  const user = document.getElementById("teleagent-user") ? document.getElementById("teleagent-user").value.trim() : "";
+  const password = document.getElementById("teleagent-password") ? document.getElementById("teleagent-password").value.trim() : "";
+  const keepaliveInterval = document.getElementById("teleagent-interval") ? (parseInt(document.getElementById("teleagent-interval").value) || 300) : 300;
+  const reloginDays = document.getElementById("teleagent-relogin-days") ? (parseInt(document.getElementById("teleagent-relogin-days").value) || 7) : 7;
+
+  if (!user || (!accId && !password)) {
+    showToast("请输入天翼星辰账号与密码", "error");
+    return;
+  }
+
+  const saveBtn = document.getElementById("btn-save-account-teleagent");
+  if (saveBtn) { saveBtn.disabled = true; saveBtn.innerText = accId ? "保存中..." : "自动滑块登录中..."; }
+
+  try {
+    if (accId) {
+      const payload = { name: name || user, user, keepaliveInterval, reloginDays };
+      if (password) {
+        payload.password = password;
+        payload.relogin = true;
+      }
+      const res = await authFetch(`/api/accounts/${accId}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        showToast("🎉 天翼星辰账号修改已保存并同步实例！", "success");
+        closeModal("account-modal");
+        await loadAccounts(true);
+      } else {
+        showToast(data.error || "更新失败", "error");
+      }
+      return;
+    }
+
+    showToast("正在通过天翼星辰原生协议验证账密并拉取实例...", "info");
+    const res = await authFetch("/api/accounts/teleagent/add", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ authMode: 'password', name, user, password, keepaliveInterval, reloginDays })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) {
+      showToast(`🎉 天翼星辰账号添加成功！发现 ${(data.desktops || []).length} 台云主机并启动保活守护`, "success");
+      closeModal("account-modal");
+      await loadAccounts(true);
+    } else {
+      showToast(data.error || `添加天翼星辰账号失败（HTTP ${res.status}）`, "error");
+    }
+  } catch (e) {
+    showToast("网络请求异常: " + e.message, "error");
+  } finally {
+    if (saveBtn) { saveBtn.disabled = false; saveBtn.innerText = "保存星辰云账号"; }
+  }
+}
+
+async function triggerTeleagentKeepalive(accId) {
+  showToast("正在执行一轮天翼星辰心跳 + 换票保活巡检...", "info");
+  try {
+    const res = await authFetch("/api/accounts/teleagent/keepalive", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: accId })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) {
+      const okCount = (data.result?.results || []).filter(r => r.ok).length;
+      showToast(`💓 天翼星辰保活巡检完成（成功 ${okCount} 台）`, "success");
+    } else {
+      showToast("保活巡检失败: " + (data.error || `HTTP ${res.status}`), "error");
+    }
+  } catch (e) {
+    showToast("请求异常: " + e.message, "error");
+  }
+  await loadAccounts(true);
+}
+
+async function triggerTeleagentSign(accId) {
+  showToast("正在执行天翼星辰每日登录积分签到...", "info");
+  try {
+    const res = await authFetch("/api/accounts/teleagent/sign", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: accId })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) {
+      showToast(data.message || "🎁 今日登录积分签到完成", "success");
+    } else {
+      showToast("签到未完成: " + (data.error || data.message || `HTTP ${res.status}`), "warning");
+    }
+  } catch (e) {
+    showToast("请求异常: " + e.message, "error");
+  }
+  await loadAccounts(true);
+}
+
+async function openTeleagentDesktop(accId, instanceId = "") {
+  showToast("正在换取天翼星辰官方网页临时票据...", "info");
+  try {
+    const res = await authFetch("/api/accounts/teleagent/open", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ accountId: accId, instanceId })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success && data.connectUrl) {
+      window.open(data.connectUrl, "_blank", "noopener,noreferrer");
+      showToast("🚀 已在新标签页打开星辰云电脑！", "success");
+    } else {
+      showToast("获取直达票据失败: " + (data.error || `HTTP ${res.status}`), "error");
+    }
+  } catch (e) {
+    showToast("请求异常: " + e.message, "error");
+  }
+}
+
+async function powerTeleagentDesktop(accId, instanceId, action, name = "") {
+  const actionMap = { poweron: '开机', reboot: '重启', cancel: '取消排队' };
+  const label = actionMap[action] || action;
+  if (action === 'reboot' && !confirm(`确定要向天翼星辰云主机 [${name || instanceId}] 下发「重启」指令吗？预计约 1 分钟恢复。`)) {
+    return;
+  }
+  showToast(`正在下发天翼星辰【${label}】指令...`, "info");
+  try {
+    const res = await authFetch(`/api/accounts/${accId}/power/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ desktopId: instanceId })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok && data.success) {
+      showToast(data.message || `已下发${label}指令，请稍后刷新查看状态`, "success");
+    } else {
+      showToast(`${label}失败: ` + (data.error || `HTTP ${res.status}`), "error");
+    }
+  } catch (e) {
+    showToast("请求异常: " + e.message, "error");
+  }
+  await loadAccounts(true);
+}
+
+async function syncTeleagentInstances(accId) {
+  showToast("正在同步天翼星辰实例状态与积分...", "info");
+  try {
+    const res = await authFetch(`/api/accounts/${accId}`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.ok) {
+      showToast(`🔄 已同步 ${(data.desktops || []).length} 台云主机状态`, "success");
+    } else {
+      showToast("同步失败: " + (data.error || `HTTP ${res.status}`), "error");
+    }
+  } catch (e) {
+    showToast("请求异常: " + e.message, "error");
+  }
+  await loadAccounts(true);
+}
+
 function editAccount(accId) {
   const acc = accounts.find(a => a.id === accId);
   if (!acc) return;
@@ -2877,6 +3852,37 @@ function editAccount(accId) {
 
   const platformTabs = document.getElementById("platform-tabs-container");
   if (platformTabs) platformTabs.style.display = "none"; // 编辑模式锁定平台
+
+  if (acc.platform === 'teleagent') {
+    document.getElementById("modal-account-title").innerText = `编辑天翼星辰账号 [${acc.name || acc.user}]`;
+    const taNameEl = document.getElementById("teleagent-name");
+    const taUserEl = document.getElementById("teleagent-user");
+    const taPwdEl = document.getElementById("teleagent-password");
+    const taIntEl = document.getElementById("teleagent-interval");
+    const taReloginEl = document.getElementById("teleagent-relogin-days");
+    if (taNameEl) taNameEl.value = acc.name || "";
+    if (taUserEl) taUserEl.value = acc.user || "";
+    if (taPwdEl) taPwdEl.value = acc.password || "";
+    if (taIntEl) {
+      const want = String(acc.keepaliveInterval || 300);
+      const exists = Array.prototype.some.call(taIntEl.options, o => o.value === want);
+      taIntEl.value = exists ? want : "300";
+    }
+    if (taReloginEl) taReloginEl.value = String(acc.reloginDays || 7);
+    const taQrNameEl = document.getElementById("ta-qr-name");
+    const taQrIntEl = document.getElementById("ta-qr-interval");
+    if (taQrNameEl) taQrNameEl.value = acc.name || "";
+    if (taQrIntEl) {
+      const wantQr = String(acc.keepaliveInterval || 300);
+      const existsQr = Array.prototype.some.call(taQrIntEl.options, o => o.value === wantQr);
+      taQrIntEl.value = existsQr ? wantQr : "300";
+    }
+
+    openModal("account-modal");
+    switchAddAccountPlatform('teleagent');
+    switchTeleagentLoginTab((acc.authMode === 'qrcode' || !acc.password) ? 'qr' : 'pwd');
+    return;
+  }
 
   if (acc.platform === 'ecloud') {
     document.getElementById("modal-account-title").innerText = `编辑移动公众账号 [${acc.name || acc.user}]`;
@@ -3335,7 +4341,7 @@ async function submitSmsBind() {
   }
 }
 
-// 5. 自动兑换与抽奖设置
+// 5. 天翼云积分自动兑换设置
 async function openRedeemModal(accId) {
   const acc = accounts.find(a => a.id === accId);
   if (!acc) return;
@@ -3345,14 +4351,12 @@ async function openRedeemModal(accId) {
   document.getElementById("redeem-enabled").checked = !!cfg.enabled;
   document.getElementById("redeem-enabled-label").innerText = cfg.enabled ? "已启用自动兑换" : "未启用";
 
-  document.getElementById("redeem-target-type").value = cfg.targetType || "redeem";
   document.getElementById("redeem-schedule-type").value = cfg.scheduleType || "monthly_days";
   document.getElementById("redeem-monthly-days").value = (cfg.monthlyDays || [-1]).join(",");
   document.getElementById("redeem-interval-days").value = cfg.intervalDays || 1;
   document.getElementById("redeem-max-times").value = cfg.maxRedeemTimes || 0;
 
   onScheduleTypeChange();
-  onTargetTypeChange();
 
   await loadProductList(cfg.prodId);
   loadAccountDesktops(accId, cfg.desktopId);
@@ -3417,16 +4421,6 @@ async function loadAccountDesktops(accId, selectedDesktopId) {
   select.innerHTML = "<option value='default'>默认主云电脑</option>";
 }
 
-function onTargetTypeChange() {
-  const type = document.getElementById("redeem-target-type").value;
-  const desktopGroup = document.getElementById("group-desktop-select");
-  if (type === "lottery") {
-    desktopGroup.classList.add("hidden");
-  } else {
-    desktopGroup.classList.remove("hidden");
-  }
-}
-
 function onScheduleTypeChange() {
   const type = document.getElementById("redeem-schedule-type").value;
   document.getElementById("group-monthly-days").classList.toggle("hidden", type !== "monthly_days");
@@ -3436,7 +4430,7 @@ function onScheduleTypeChange() {
 async function saveRedeemConfig() {
   const accId = document.getElementById("redeem-acc-id").value;
   const enabled = document.getElementById("redeem-enabled").checked;
-  const targetType = document.getElementById("redeem-target-type").value;
+  const targetType = "redeem";
   const prodSelect = document.getElementById("redeem-product-select");
   const selectedOpt = prodSelect.options[prodSelect.selectedIndex];
 
@@ -3475,7 +4469,7 @@ async function saveRedeemConfig() {
       })
     });
     if (res.ok) {
-      showToast("自动兑换与抽奖配置已保存！", "success");
+      showToast("积分自动兑换配置已保存！", "success");
       closeModal("redeem-modal");
       loadAccounts();
     } else {
@@ -3487,7 +4481,7 @@ async function saveRedeemConfig() {
 }
 
 // ==========================================
-// 手动积分兑换 / 幸运抽奖
+// 手动积分商城兑换
 // ==========================================
 async function openManualRedeemModal(accId) {
   const acc = accounts.find(a => a.id === accId);
@@ -3669,11 +4663,47 @@ async function openPowerModal(accId, desktopId = '', desktopName = '') {
   currentPowerDesktopId = desktopId || '';
 
   const select = document.getElementById("power-desktop-select");
+  const descEl = document.getElementById("power-modal-desc");
+  const btnBoot = document.getElementById("power-btn-boot");
+  const btnShutdown = document.getElementById("power-btn-shutdown");
+  const btnCancelQ = document.getElementById("power-btn-cancel-queue");
+  const btnGrid = document.getElementById("power-btn-grid");
+
   select.innerHTML = "<option value=''>正在获取名下云主机...</option>";
   document.getElementById("power-desktop-status").innerHTML = `<span style="color: #64748b;">检测中...</span>`;
   openModal("power-modal");
 
+  if (acc.platform === 'teleagent') {
+    if (descEl) descEl.innerText = "向天翼星辰（TeleAgent）下达电源控制指令（支持开机、重启及排队中取消排队）。重启约需 1 分钟恢复，操作前请保存重要数据。";
+    setPowerBootButtonEnabled(true);
+    if (btnBoot) btnBoot.innerText = "🟢 远程开机";
+    if (btnShutdown) btnShutdown.classList.add("hidden");
+    if (btnCancelQ) btnCancelQ.classList.add("hidden");
+    if (btnGrid) btnGrid.style.gridTemplateColumns = "1fr 1fr";
+
+    const list = (acc.desktops || acc.liveMetrics?.desktops || []).map(d => {
+      const view = d.keepAliveView || null;
+      const ps = String((view && view.powerState) || d.powerState || '').toLowerCase();
+      return {
+        desktopId: String(d.instanceId || d.id || ''),
+        desktopName: d.desktopName || '星辰云电脑',
+        useStatusText: (view && view.statusText) || d.statusText || '状态未知',
+        powerState: ps,
+        flavorName: d.specStr || ''
+      };
+    });
+    renderPowerDesktopSelect(list, desktopId);
+    return;
+  }
+
+  // 非 TeleAgent：恢复默认三按钮（开机/重启/关机）
+  if (btnBoot) btnBoot.innerText = "🟢 开机 / 唤醒";
+  if (btnShutdown) btnShutdown.classList.remove("hidden");
+  if (btnCancelQ) btnCancelQ.classList.add("hidden");
+  if (btnGrid) btnGrid.style.gridTemplateColumns = "1fr 1fr 1fr";
+
   if (acc.platform === 'ydpc') {
+    if (descEl) descEl.innerText = "向中国移动云电脑下达电源控制指令。执行重启或关机前请确保云电脑内已保存重要数据。";
     // 2026-09-23：开机能力已恢复（CAG 干净通道），重新显示开机按钮
     setPowerBootButtonEnabled(true);
     const vms = (acc.vms && acc.vms.length > 0) ? acc.vms : (acc.desktops || []);
@@ -3688,11 +4718,13 @@ async function openPowerModal(accId, desktopId = '', desktopName = '') {
   }
 
   // 天翼云
+  if (descEl) descEl.innerText = "向天翼云下达电源控制指令。执行重启或关机前请确保云电脑内已保存重要数据。";
   setPowerBootButtonEnabled(true);
   const localList = (acc.desktops && acc.desktops.length > 0) ? acc.desktops : (acc.liveMetrics?.desktopName ? [{
     desktopId: acc.liveMetrics?.desktopId || acc.stats?.desktopId || '0',
     desktopName: acc.liveMetrics?.desktopName,
-    useStatusText: '运行中',
+    useStatusText: '状态未知',
+    powerState: 'unknown',
     flavorName: ''
   }] : []);
 
@@ -3724,9 +4756,11 @@ function renderPowerDesktopSelect(list, targetDesktopId) {
   list.forEach((d, idx) => {
     const opt = document.createElement("option");
     opt.value = d.desktopId;
-    opt.dataset.status = d.useStatusText || '运行中';
+    const statusLabel = d.useStatusText || '状态未知';
+    opt.dataset.status = statusLabel;
+    opt.dataset.powerState = d.powerState || '';
     const flavor = d.flavorName ? ` [${d.flavorName}]` : '';
-    opt.innerText = `🖥️ ${d.desktopName || '云电脑'}${flavor} - (${d.useStatusText || '运行中'})`;
+    opt.innerText = `🖥️ ${d.desktopName || '云电脑'}${flavor} - (${statusLabel})`;
     
     // 如果指定了 targetDesktopId，或者首项匹配
     if (targetDesktopId && String(targetDesktopId) === String(d.desktopId)) {
@@ -3749,8 +4783,27 @@ function onPowerDesktopChange() {
   const selectedOpt = select.options[select.selectedIndex];
   if (selectedOpt && selectedOpt.dataset.status) {
     const st = selectedOpt.dataset.status;
-    const isRunning = st.includes('运行');
-    statusEl.innerHTML = `<span style="color: ${isRunning ? '#16a34a' : '#d97706'}; font-weight:700;">${isRunning ? '🟢 ' : '⚪ '}${st}</span>`;
+    const ps = String(selectedOpt.dataset.powerState || '').toLowerCase();
+    const isRunning = ps === 'on' || st.includes('运行');
+    const isSleeping = ps === 'sleeping' || /休眠|睡眠/.test(st);
+    const color = isRunning ? '#16a34a' : (isSleeping ? '#7e22ce' : '#d97706');
+    const icon = isRunning ? '🟢 ' : (isSleeping ? '💤 ' : '⚪ ');
+    statusEl.innerHTML = `<span style="color: ${color}; font-weight:700;">${icon}${escapeHtml(st)}</span>`;
+
+    // TeleAgent 排队状态时额外展示“取消排队”按钮
+    const accId = document.getElementById("power-acc-id")?.value;
+    const acc = accounts.find(a => a.id === accId);
+    const btnCancelQ = document.getElementById("power-btn-cancel-queue");
+    const btnGrid = document.getElementById("power-btn-grid");
+    if (acc && acc.platform === 'teleagent' && btnCancelQ && btnGrid) {
+      if (ps === 'queue') {
+        btnCancelQ.classList.remove("hidden");
+        btnGrid.style.gridTemplateColumns = "1fr 1fr 1fr";
+      } else {
+        btnCancelQ.classList.add("hidden");
+        btnGrid.style.gridTemplateColumns = "1fr 1fr";
+      }
+    }
   } else {
     statusEl.innerHTML = `<span style="color: #64748b;">就绪</span>`;
   }
@@ -3759,13 +4812,35 @@ function onPowerDesktopChange() {
 async function executePowerAction(action) {
   const accId = document.getElementById("power-acc-id").value;
   const acc = accounts.find(a => a.id === accId);
-  const actionNames = { poweron: '开机 / 唤醒', reboot: '重启', shutdown: '关机' };
+  const actionNames = { poweron: '开机 / 唤醒', reboot: '重启', shutdown: '关机', cancel: '取消排队' };
   const actionName = actionNames[action] || action;
 
-  if (action === 'shutdown' || action === 'reboot') {
+  if (action === 'shutdown' || action === 'reboot' || action === 'cancel') {
     if (!confirm(`确认要对云电脑下达【${actionName}】指令吗？未保存的数据可能会丢失。`)) {
       return;
     }
+  }
+
+  if (acc && acc.platform === 'teleagent') {
+    showToast(`正在向天翼星辰下发【${actionName}】指令...`, "info");
+    try {
+      const res = await authFetch(`/api/accounts/${accId}/power/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ desktopId: currentPowerDesktopId })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        showToast(data.message || `已下发天翼星辰【${actionName}】指令，请稍后刷新查看状态`, "success");
+        closeModal("power-modal");
+        await loadAccounts(true);
+      } else {
+        showToast(`操作未成功: ${data.error || data.message || '网关拒绝'}`, "error");
+      }
+    } catch (e) {
+      showToast("请求异常: " + e.message, "error");
+    }
+    return;
   }
 
   if (acc && acc.platform === 'ydpc') {
@@ -4058,16 +5133,24 @@ async function openUserNotifyModal() {
       document.getElementById("user-notify-secret").value = notify.secret || "";
     }
     if (document.getElementById("user-notify-title-tpl")) {
-      document.getElementById("user-notify-title-tpl").value = notify.customTitleTemplate || "";
+      document.getElementById("user-notify-title-tpl").value = notify.customTitleTemplate || DEFAULT_NOTIFY_TITLE_TEMPLATE;
     }
     if (document.getElementById("user-notify-content-tpl")) {
-      document.getElementById("user-notify-content-tpl").value = notify.customContentTemplate || "";
+      document.getElementById("user-notify-content-tpl").value = notify.customContentTemplate || DEFAULT_NOTIFY_CONTENT_TEMPLATE;
     }
     onUserNotifyChannelChange(false);
     openModal("user-notify-modal");
   } catch (e) {
     showToast("获取个人通知设置失败: " + e.message, "error");
   }
+}
+
+function resetUserNotifyTemplates() {
+  const titleEl = document.getElementById("user-notify-title-tpl");
+  const contentEl = document.getElementById("user-notify-content-tpl");
+  if (titleEl) titleEl.value = DEFAULT_NOTIFY_TITLE_TEMPLATE;
+  if (contentEl) contentEl.value = DEFAULT_NOTIFY_CONTENT_TEMPLATE;
+  showToast("已恢复默认通知标题与内容模板", "info");
 }
 
 function onUserNotifyChannelChange(isUserSwitch = true) {
@@ -4109,7 +5192,8 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
       (channel !== "bark" && currentVal.includes("api.day.app")) ||
       (channel !== "pushplus" && currentVal.includes("pushplus.plus")) ||
       (channel !== "serverchan" && currentVal.includes("ftqq.com")) ||
-      (channel !== "telegram" && currentVal.includes("api.telegram.org"));
+      (channel !== "telegram" && currentVal.includes("api.telegram.org")) ||
+      (channel !== "discord" && (currentVal.includes("discord.com/api/webhooks") || currentVal.includes("discordapp.com/api/webhooks")));
     if (isOtherChannelUrl) {
       input.value = "";
       if (secretInput) secretInput.value = "";
@@ -4137,6 +5221,9 @@ function onUserNotifyChannelChange(isUserSwitch = true) {
   } else if (channel === "telegram") {
     label.innerText = "TG BotToken (格式: token@chatId)";
     input.placeholder = "BotToken@ChatId";
+  } else if (channel === "discord") {
+    label.innerText = "Discord Webhook 地址";
+    input.placeholder = "https://discord.com/api/webhooks/xxxx/xxxx";
   } else {
     label.innerText = "自定义 Webhook URL";
     input.placeholder = "https://example.com/webhook";
@@ -4147,8 +5234,8 @@ async function testUserNotify() {
   const channel = document.getElementById("user-notify-channel") ? document.getElementById("user-notify-channel").value : "webhook";
   const webhookUrl = document.getElementById("user-notify-token") ? document.getElementById("user-notify-token").value.trim() : "";
   const secret = document.getElementById("user-notify-secret") ? document.getElementById("user-notify-secret").value.trim() : "";
-  const customTitleTemplate = document.getElementById("user-notify-title-tpl") ? document.getElementById("user-notify-title-tpl").value.trim() : "";
-  const customContentTemplate = document.getElementById("user-notify-content-tpl") ? document.getElementById("user-notify-content-tpl").value.trim() : "";
+  const customTitleTemplate = (document.getElementById("user-notify-title-tpl") ? document.getElementById("user-notify-title-tpl").value.trim() : "") || DEFAULT_NOTIFY_TITLE_TEMPLATE;
+  const customContentTemplate = (document.getElementById("user-notify-content-tpl") ? document.getElementById("user-notify-content-tpl").value.trim() : "") || DEFAULT_NOTIFY_CONTENT_TEMPLATE;
 
   if (!webhookUrl) {
     showToast("请先输入推送地址或 Token", "error");
@@ -4179,8 +5266,8 @@ async function saveUserNotify() {
     channel: document.getElementById("user-notify-channel") ? document.getElementById("user-notify-channel").value : "webhook",
     webhookUrl: document.getElementById("user-notify-token") ? document.getElementById("user-notify-token").value.trim() : "",
     secret: document.getElementById("user-notify-secret") ? document.getElementById("user-notify-secret").value.trim() : "",
-    customTitleTemplate: document.getElementById("user-notify-title-tpl") ? document.getElementById("user-notify-title-tpl").value.trim() : "",
-    customContentTemplate: document.getElementById("user-notify-content-tpl") ? document.getElementById("user-notify-content-tpl").value.trim() : ""
+    customTitleTemplate: (document.getElementById("user-notify-title-tpl") ? document.getElementById("user-notify-title-tpl").value.trim() : "") || DEFAULT_NOTIFY_TITLE_TEMPLATE,
+    customContentTemplate: (document.getElementById("user-notify-content-tpl") ? document.getElementById("user-notify-content-tpl").value.trim() : "") || DEFAULT_NOTIFY_CONTENT_TEMPLATE
   };
 
   try {
@@ -4201,52 +5288,81 @@ async function saveUserNotify() {
   }
 }
 
-// 9. 实时控制台日志与分类过滤 (三维绝对隔离：平台筛选 + 业务事件)
+// 9. 实时控制台日志与分类过滤 (多维隔离：平台筛选 + 业务事件 + 关键词搜索 + 容量保护)
 function switchPlatformFilter(platform) {
   activePlatformFilter = platform;
-  const pAll = document.getElementById('tab-platform-all');
-  const pCt = document.getElementById('tab-platform-ctyun');
-  const pYd = document.getElementById('tab-platform-ydpc');
-  const pEc = document.getElementById('tab-platform-ecloud');
-  if (pAll) pAll.className = platform === 'all' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
-  if (pCt) pCt.className = platform === 'ctyun' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
-  if (pYd) pYd.className = platform === 'ydpc' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
-  if (pEc) pEc.className = platform === 'ecloud' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
+  const map = {
+    all: 'tab-platform-all',
+    ctyun: 'tab-platform-ctyun',
+    ydpc: 'tab-platform-ydpc',
+    ecloud: 'tab-platform-ecloud',
+    teleagent: 'tab-platform-teleagent',
+    system: 'tab-platform-system'
+  };
+  for (const [key, id] of Object.entries(map)) {
+    const el = document.getElementById(id);
+    if (el) el.className = platform === key ? 'btn btn-sm btn-primary' : 'btn btn-sm';
+  }
   renderFilteredLogs();
 }
 
 function switchLogFilter(filterType) {
   activeLogFilter = filterType;
-  const tTasks = document.getElementById('tab-tasks');
-  const tHeart = document.getElementById('tab-heartbeat');
-  const tAll = document.getElementById('tab-all');
-  if (tTasks) tTasks.className = filterType === 'tasks' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
-  if (tHeart) tHeart.className = filterType === 'heartbeat' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
-  if (tAll) tAll.className = filterType === 'all' ? 'btn btn-sm btn-primary' : 'btn btn-sm';
+  const map = {
+    all: 'tab-all',
+    heartbeat: 'tab-heartbeat',
+    tasks: 'tab-tasks',
+    alert: 'tab-alert'
+  };
+  for (const [key, id] of Object.entries(map)) {
+    const el = document.getElementById(id);
+    if (el) el.className = filterType === key ? 'btn btn-sm btn-primary' : 'btn btn-sm';
+  }
   renderFilteredLogs();
 }
 
-// 统一日志可见性判定引擎 (双维过滤：平台隔离 + 业务类型)
+function onLogSearchInput(val) {
+  logSearchKeyword = String(val || '').trim().toLowerCase();
+  renderFilteredLogs();
+}
+
+function updateLogCountBadge() {
+  const el = document.getElementById("log-count-badge");
+  if (el) el.innerText = `${renderedLogLines.size} / ${allReceivedLogs.length} 条`;
+}
+
+// 统一日志可见性判定引擎 (双维过滤：平台隔离 + 业务类型 + 关键词)
 function shouldDisplayLogItem(item) {
   if (!item) return false;
 
-  // 1. 平台维度绝对隔离（三平台各自成流：天翼云 / 移动爱家 / 移动公众）
-  const isSystemOrAuth = item.source === 'System' || item.source === 'Auth' || item.source === 'Admin' || item.source === 'Notify';
-  if (!isSystemOrAuth) {
+  // 1. 平台维度绝对隔离（四平台 + 系统日志各自成流）
+  const isSystemOrAuth = item.source === 'System' || item.source === 'Auth' || item.source === 'Admin' || item.source === 'Notify' || item.source === 'Keeper';
+  if (activePlatformFilter === 'system') {
+    if (!isSystemOrAuth && item.source !== 'Scheduler') return false;
+  } else if (!isSystemOrAuth) {
     if (activePlatformFilter === 'ctyun' && item.platform !== 'ctyun') return false;
     if (activePlatformFilter === 'ydpc' && item.platform !== 'ydpc') return false;
     if (activePlatformFilter === 'ecloud' && item.platform !== 'ecloud') return false;
+    if (activePlatformFilter === 'teleagent' && item.platform !== 'teleagent') return false;
+  } else if (activePlatformFilter !== 'all') {
+    // 选择了具体云平台时，不让系统杂项日志刷屏（仅在全部或系统视图展示）
+    return false;
   }
 
-  // 2. 业务事件维度过滤 (心跳/长连保活 vs 业务任务)
-  //    【2026-09-23】CAGRAW（数据面保活）与 MQTT（官方长连链路）同属心跳保活类，
-  //    此前漏配导致它们被误归入「任务」分类。
-  //    【2026-09-24】ECLOUD（移动公众协议侧车）同属保活类；日志源独立于 SOHO/CAG，互不混流。
+  // 2. 业务事件维度过滤 (全部 / 心跳保活 / 任务 / 异常告警)
+  const isTeleagentSignTask = item.source === 'TELEAGENT' && /签到|积分/.test(String(item.message || ''));
   const isHeartbeat = item.source === 'Heartbeat' || item.source === 'CAG' || item.source === 'CAGRAW'
     || item.source === 'KeepAlive' || item.source === 'SOHO' || item.source === 'MQTT'
-    || item.source === 'ECLOUD';
+    || item.source === 'ECLOUD' || (item.source === 'TELEAGENT' && !isTeleagentSignTask);
   if (activeLogFilter === 'heartbeat' && !isHeartbeat) return false;
   if (activeLogFilter === 'tasks' && isHeartbeat) return false;
+  if (activeLogFilter === 'alert' && item.level !== 'error' && item.level !== 'warning') return false;
+
+  // 3. 关键词检索
+  if (logSearchKeyword) {
+    const hay = `${item.timestamp || ''} ${item.source || ''} ${item.accountName || ''} ${item.message || ''}`.toLowerCase();
+    if (!hay.includes(logSearchKeyword)) return false;
+  }
   return true;
 }
 
@@ -4284,11 +5400,20 @@ function upsertLogList(list, item) {
   return 'inserted';
 }
 
+function logPlatformBadgeHtml(item) {
+  const isSys = item.source === 'System' || item.source === 'Auth' || item.source === 'Admin' || item.source === 'Notify' || item.source === 'Keeper';
+  if (isSys) return `<span class="log-plat-badge log-plat-system">系统</span>`;
+  if (item.platform === 'teleagent') return `<span class="log-plat-badge log-plat-teleagent">星辰</span>`;
+  if (item.platform === 'ecloud') return `<span class="log-plat-badge log-plat-ecloud">公众</span>`;
+  if (item.platform === 'ydpc') return `<span class="log-plat-badge log-plat-ydpc">爱家</span>`;
+  return `<span class="log-plat-badge log-plat-ctyun">天翼</span>`;
+}
+
 function logLineInnerHtml(item) {
   const repeatBadge = (item.repeatCount && item.repeatCount > 1)
     ? `<span class="badge-repeat">x${item.repeatCount}</span>`
     : '';
-  return `<span class="log-time">[${item.timestamp}]</span><span class="log-source">[${item.source}]</span><span class="log-text">${escapeHtml(item.message)}</span>${repeatBadge}`;
+  return `<span class="log-time">[${item.timestamp}]</span>${logPlatformBadgeHtml(item)}<span class="log-source">[${escapeHtml(item.source)}]</span><span class="log-text">${escapeHtml(item.message)}</span>${repeatBadge}`;
 }
 
 function createLogLineElement(item) {
@@ -4300,8 +5425,9 @@ function createLogLineElement(item) {
   return line;
 }
 
-/** 渲染行数上限：与内存数组 3000 上限同源，避免长期运行后 DOM 无界增长 */
-const MAX_RENDERED_LOG_LINES = 2000;
+/** 渲染与前端缓存上限：避免长期运行产生巨量 DOM 节点拖慢页面 */
+const MAX_CACHED_LOG_LINES = 1500;
+const MAX_RENDERED_LOG_LINES = 800;
 
 /**
  * 把一条日志（新增 或 折叠更新）**幂等**地落到 DOM 上。
@@ -4361,12 +5487,13 @@ function renderFilteredLogs() {
     return;
   }
 
-  filtered.forEach(item => {
+  filtered.slice(-MAX_RENDERED_LOG_LINES).forEach(item => {
     const line = createLogLineElement(item);
     logBox.appendChild(line);
     renderedLogLines.set(logLineKey(item), line);
   });
 
+  updateLogCountBadge();
   if (autoScroll) logBox.scrollTop = logBox.scrollHeight;
 }
 
@@ -4399,16 +5526,17 @@ async function initLogStream() {
       const item = JSON.parse(e.data);
       const logBox = document.getElementById("log-content");
 
-      // 【2026-09-25 用户要求·第六轮】新增 与 折叠更新 走**同一条幂等路径**。
-      //
-      // 旧逻辑有两个致命缺口，合起来就是用户看到的"同一件事 x3353、x3354、x3355 … 铺一屏"：
-      //   ① isUpdate 分支用 `l.id === item.id || 同 source+account` 在数组里找条目 ——
-      //      后半句会把**同源同账号的其它条目**误当作自己，于是数组越换越乱；
-      //   ② 非 isUpdate 分支（也就是服务端每次连接都会重发的最近 80 条历史）**无条件 push
-      //      与 appendChild** —— 每重连一次就整批再画一遍，且每条都带着"当时那一刻"的 xN 快照。
-      // 现在统一为：数组按身份键就地 upsert，DOM 也按身份键就地 upsert。
+      // 响应后端清屏控制广播（多窗口联动同步清屏）
+      if (item && item.__clear === true) {
+        allReceivedLogs = [];
+        renderedLogLines.clear();
+        if (logBox) logBox.innerHTML = `<div class="log-line" style="color: #64748b; padding: 12px 0; text-align: center;">[前后端日志已彻底清空]</div>`;
+        updateLogCountBadge();
+        return;
+      }
+
       upsertLogList(allReceivedLogs, item);
-      if (allReceivedLogs.length > 3000) {
+      if (allReceivedLogs.length > MAX_CACHED_LOG_LINES) {
         const dropped = allReceivedLogs.shift();
         // 内存淘汰同步反映到 DOM，避免两处视图长期不一致
         const droppedKey = logLineKey(dropped);
@@ -4420,6 +5548,7 @@ async function initLogStream() {
       }
 
       upsertLogLine(logBox, item);
+      updateLogCountBadge();
       if (autoScroll && logBox) logBox.scrollTop = logBox.scrollHeight;
     } catch (err) {}
   };
@@ -4440,12 +5569,13 @@ async function clearLogs() {
   allReceivedLogs = [];
   renderedLogLines.clear();
   document.getElementById("log-content").innerHTML = `<div class="log-line" style="color: #64748b; padding: 12px 0; text-align: center;">[日志已彻底清空]</div>`;
+  updateLogCountBadge();
   
-  // 联动后端持久化清空
+  // 联动后端持久化清空（同步清空内存、折叠索引及管理员磁盘日志）
   try {
     const res = await authFetch('/api/logs/clear', { method: 'POST' });
     if (res.ok) {
-      showToast("控制台与后台历史日志已全部一键清空", "success");
+      showToast("前端与后端历史日志已全部彻底清空", "success");
     } else {
       showToast("前端已清屏", "info");
     }
@@ -4456,7 +5586,15 @@ async function clearLogs() {
 
 function toggleAutoScroll() {
   autoScroll = !autoScroll;
-  document.getElementById("btn-autoscroll").innerText = `自动滚动: ${autoScroll ? '开' : '关'}`;
+  const btn = document.getElementById("btn-autoscroll");
+  if (btn) {
+    btn.innerText = `自动滚动: ${autoScroll ? '开' : '关'}`;
+    btn.className = autoScroll ? 'btn btn-sm btn-primary' : 'btn btn-sm';
+  }
+  if (autoScroll) {
+    const logBox = document.getElementById("log-content");
+    if (logBox) logBox.scrollTop = logBox.scrollHeight;
+  }
 }
 
 function copyToClipboard(text) {

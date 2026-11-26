@@ -4,6 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
   <title>天翼云 / 移动爱家 保活签到中心</title>
+  <link rel="icon" type="image/png" href="/static/favicon.png">
+  <link rel="apple-touch-icon" href="/static/favicon.png">
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -97,6 +99,7 @@
           <button class="btn btn-sm" id="view-tab-ctyun" onclick="switchAccountViewTab('ctyun')">☁️ 天翼云电脑</button>
           <button class="btn btn-sm" id="view-tab-ydpc" onclick="switchAccountViewTab('ydpc')">🏠 移动爱家</button>
           <button class="btn btn-sm" id="view-tab-ecloud" onclick="switchAccountViewTab('ecloud')">📡 移动公众</button>
+          <button class="btn btn-sm" id="view-tab-teleagent" onclick="switchAccountViewTab('teleagent')">🌟 天翼星辰</button>
         </div>
         <button class="btn-refresh" onclick="loadAccounts()">🔄 刷新列表</button>
       </div>
@@ -117,6 +120,7 @@
           </div>
           <span class="log-title">实时控制台日志</span>
           <span class="badge badge-online" id="log-status">已连接</span>
+          <span class="badge" id="log-count-badge" style="background:#f1f5f9;color:#475569;border:1px solid #cbd5e1;font-size:11px;">0 条</span>
         </div>
         
         <div class="log-header-controls">
@@ -126,6 +130,8 @@
             <button class="btn btn-sm" id="tab-platform-ctyun" onclick="switchPlatformFilter('ctyun')">☁️ 天翼云</button>
             <button class="btn btn-sm" id="tab-platform-ydpc" onclick="switchPlatformFilter('ydpc')">🏠 移动爱家</button>
             <button class="btn btn-sm" id="tab-platform-ecloud" onclick="switchPlatformFilter('ecloud')">📡 移动公众</button>
+            <button class="btn btn-sm" id="tab-platform-teleagent" onclick="switchPlatformFilter('teleagent')">🌟 天翼星辰</button>
+            <button class="btn btn-sm" id="tab-platform-system" onclick="switchPlatformFilter('system')">⚙️ 系统</button>
           </div>
 
           <!-- 业务事件子按钮（【2026-09-24 用户要求·第三轮】顺序 = 全部 → 心跳保活 → 任务，且默认选中「全部」） -->
@@ -133,10 +139,12 @@
             <button class="btn btn-sm btn-primary" id="tab-all" onclick="switchLogFilter('all')">📄 全部</button>
             <button class="btn btn-sm" id="tab-heartbeat" onclick="switchLogFilter('heartbeat')">📡 心跳保活</button>
             <button class="btn btn-sm" id="tab-tasks" onclick="switchLogFilter('tasks')">🎯 任务</button>
+            <button class="btn btn-sm" id="tab-alert" onclick="switchLogFilter('alert')">⚠️ 异常告警</button>
           </div>
 
-          <div class="log-action-group">
-            <button class="btn btn-sm" onclick="clearLogs()">清屏</button>
+          <div class="log-action-group" style="display:flex;align-items:center;gap:6px;">
+            <input type="text" class="log-search-input" id="log-search-input" placeholder="筛选关键词..." oninput="onLogSearchInput(this.value)">
+            <button class="btn btn-sm" onclick="clearLogs()" title="同时清空前端屏幕与后端历史日志">清屏</button>
             <button class="btn btn-sm" id="btn-autoscroll" onclick="toggleAutoScroll()">自动滚动: 开</button>
           </div>
         </div>
@@ -157,11 +165,12 @@
       <div class="modal-body">
         <input type="hidden" id="acc-id">
         
-        <!-- 平台选择 Tab (三平台并行：天翼云 / 移动爱家 / 移动公众) -->
+        <!-- 平台选择 Tab (四平台并行：天翼云 / 移动爱家 / 移动公众 / 天翼星辰) -->
         <div id="platform-tabs-container" style="display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; background: #f1f5f9; padding: 4px; border-radius: var(--radius); border: 1px solid var(--border);">
-          <button type="button" class="btn btn-sm btn-primary" id="platform-tab-ctyun" style="flex: 1 1 30%; min-width: 96px; padding: 8px 0; font-weight: 700;" onclick="switchAddAccountPlatform('ctyun')">☁️ 天翼云电脑</button>
-          <button type="button" class="btn btn-sm" id="platform-tab-ydpc" style="flex: 1 1 30%; min-width: 96px; padding: 8px 0; font-weight: 700;" onclick="switchAddAccountPlatform('ydpc')">🏠 移动爱家</button>
-          <button type="button" class="btn btn-sm" id="platform-tab-ecloud" style="flex: 1 1 30%; min-width: 96px; padding: 8px 0; font-weight: 700;" onclick="switchAddAccountPlatform('ecloud')">📡 移动公众</button>
+          <button type="button" class="btn btn-sm btn-primary" id="platform-tab-ctyun" style="flex: 1 1 22%; min-width: 90px; padding: 8px 0; font-weight: 700;" onclick="switchAddAccountPlatform('ctyun')">☁️ 天翼云电脑</button>
+          <button type="button" class="btn btn-sm" id="platform-tab-ydpc" style="flex: 1 1 22%; min-width: 90px; padding: 8px 0; font-weight: 700;" onclick="switchAddAccountPlatform('ydpc')">🏠 移动爱家</button>
+          <button type="button" class="btn btn-sm" id="platform-tab-ecloud" style="flex: 1 1 22%; min-width: 90px; padding: 8px 0; font-weight: 700;" onclick="switchAddAccountPlatform('ecloud')">📡 移动公众</button>
+          <button type="button" class="btn btn-sm" id="platform-tab-teleagent" style="flex: 1 1 22%; min-width: 90px; padding: 8px 0; font-weight: 700;" onclick="switchAddAccountPlatform('teleagent')">🌟 天翼星辰</button>
         </div>
 
         <!-- ================= 1. 天翼云面板 ================= -->
@@ -183,12 +192,15 @@
             </div>
             <div id="qrcode-wrapper" style="display: inline-block; padding: 10px; background: #ffffff; border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); min-width: 170px; min-height: 170px;">
               <img id="acc-qrcode-img" src="" style="width: 160px; height: 160px; display: none;">
-              <div id="acc-qrcode-loading" style="width: 160px; height: 160px; display: flex; align-items: center; justify-content: center; font-size: 13px; color: var(--text-muted);">
-                正在生成官方二维码...
+              <div id="acc-qrcode-loading" style="width: 160px; height: 160px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); text-align: center; padding: 6px;">
+                <span>点击下方按钮获取官方登录二维码</span>
               </div>
             </div>
-            <div id="acc-qrcode-hint" style="margin-top: 6px; font-size: 12px; color: #2563eb; font-weight: 600;">
-              等待扫码确认中...
+            <div style="margin-top: 10px;">
+              <button type="button" class="btn btn-sm btn-primary" id="btn-ctyun-get-qr" onclick="loadQrCodeForModal()">📱 获取登录二维码</button>
+            </div>
+            <div id="acc-qrcode-hint" style="margin-top: 6px; font-size: 12px; color: var(--text-muted); font-weight: 600;">
+              请先点击上方按钮获取二维码后再扫码登录
             </div>
           </div>
 
@@ -265,7 +277,10 @@
           <div class="form-group">
             <label>保活心跳与握手周期</label>
             <select class="form-control" id="ydpc-interval">
-              <option value="600">10 分钟 (标准推荐)</option>
+              <option value="60">1 分钟 (高频精细)</option>
+              <option value="180">3 分钟 (精细保活)</option>
+              <option value="300">5 分钟</option>
+              <option value="600" selected>10 分钟 (标准推荐)</option>
               <option value="1200">20 分钟</option>
               <option value="1680">28 分钟 (极低功耗)</option>
               <option value="3600">1 小时</option>
@@ -273,6 +288,81 @@
           </div>
           <!-- 【2026-09-28】移动云侧的开机与守护由账号卡片内的「🛡️ 自动开机守护」控制
                （账号级 + 单机双开关，默认口径按底座分叉）；添加账号表单不再重复提供开关。 -->
+        </div>
+
+        <!-- ================= 2.5 天翼星辰（TeleAgent）面板 ================= -->
+        <div id="panel-add-teleagent" class="hidden">
+          <div id="ta-login-tabs" style="display: flex; gap: 8px; margin-bottom: 10px; border-bottom: 1px solid var(--border); padding-bottom: 8px;">
+            <button type="button" class="btn btn-sm btn-primary" id="ta-tab-btn-qr" onclick="switchTeleagentLoginTab('qr')">📱 天翼账号扫码登录 (推荐)</button>
+            <button type="button" class="btn btn-sm" id="ta-tab-btn-pwd" onclick="switchTeleagentLoginTab('pwd')">🔑 账号密码登录</button>
+          </div>
+
+          <!-- TeleAgent 官方扫码登录视图（默认推荐，需手动点击按钮才获取二维码） -->
+          <div id="ta-login-panel-qr" style="text-align: center; padding: 0;">
+            <div class="form-group" style="text-align: left; margin-bottom: 8px;">
+              <label style="margin-bottom: 2px;">账号备注名 (选填)</label>
+              <input type="text" class="form-control" id="ta-qr-name" placeholder="例如：星辰主力机 / 测试账号 (留空则自动生成)">
+            </div>
+            <div class="form-group" style="text-align: left; margin-bottom: 8px;">
+              <label style="margin-bottom: 2px;">保活心跳与换票周期</label>
+              <select class="form-control" id="ta-qr-interval">
+                <option value="60">1 分钟 (高频精细)</option>
+                <option value="180">3 分钟 (精细保活)</option>
+                <option value="300" selected>5 分钟 (标准推荐)</option>
+                <option value="600">10 分钟</option>
+                <option value="900">15 分钟</option>
+                <option value="1800">30 分钟 (低功耗)</option>
+              </select>
+            </div>
+            <div style="font-size: 12.5px; color: var(--text-muted); margin-bottom: 8px;">
+              使用手机 <b>天翼账号 / 小翼管家 / 电信营业厅 App</b> 扫描官方二维码即可授权登录（免输密码与滑块）。
+            </div>
+            <div id="ta-qrcode-wrapper" style="display: inline-block; padding: 10px; background: #ffffff; border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 2px 6px rgba(0,0,0,0.05); min-width: 170px; min-height: 170px;">
+              <img id="ta-qrcode-img" src="" style="width: 160px; height: 160px; display: none;">
+              <div id="ta-qrcode-loading" style="width: 160px; height: 160px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; font-size: 12.5px; color: var(--text-muted); text-align: center; padding: 6px;">
+                <span>点击下方按钮获取天翼星辰官方二维码</span>
+              </div>
+            </div>
+            <div style="margin-top: 10px;">
+              <button type="button" class="btn btn-sm btn-primary" id="btn-ta-get-qr" onclick="loadTeleagentQrCode()">📱 获取登录二维码</button>
+            </div>
+            <div id="ta-qrcode-hint" style="margin-top: 6px; font-size: 12px; color: var(--text-muted); font-weight: 600;">
+              请先点击上方按钮获取二维码后再扫码授权
+            </div>
+          </div>
+
+          <!-- TeleAgent 账号密码登录视图 -->
+          <div id="ta-login-panel-pwd" class="hidden">
+            <div class="form-group">
+              <label>账号备注名</label>
+              <input type="text" class="form-control" id="teleagent-name" placeholder="例如：星辰主力机 / 测试账号">
+            </div>
+            <div class="form-group">
+              <label>账号 / 手机号 <span style="color:red">*</span></label>
+              <input type="text" class="form-control" id="teleagent-user" placeholder="请输入天翼星辰 TeleAgent 登录账号或手机号">
+            </div>
+            <div class="form-group">
+              <label>密码 <span style="color:red">*</span></label>
+              <input type="password" class="form-control" id="teleagent-password" placeholder="请输入登录密码">
+            </div>
+            <div class="form-group">
+              <label>保活心跳与换票周期</label>
+              <select class="form-control" id="teleagent-interval">
+                <option value="60">1 分钟 (高频精细)</option>
+                <option value="180">3 分钟 (精细保活)</option>
+                <option value="300" selected>5 分钟 (标准推荐)</option>
+                <option value="600">10 分钟</option>
+                <option value="900">15 分钟</option>
+                <option value="1800">30 分钟 (低功耗)</option>
+              </select>
+              <div class="form-text">单台云主机可在卡片上单独覆盖该周期。</div>
+            </div>
+            <div class="form-group">
+              <label>凭据临期自动重登阈值（天）</label>
+              <input type="number" class="form-control" id="teleagent-relogin-days" value="7" min="1" max="25">
+              <div class="form-text">JWT 有效期约 30 天，剩余天数低于该值时自动使用已保存账密静默续期。</div>
+            </div>
+          </div>
         </div>
 
         <!-- ================= 3. 移动公众面板（独立登录 UI，区别于天翼云扫码 / 移动爱家图形验证码） ================= -->
@@ -301,7 +391,9 @@
           <div class="form-group">
             <label>保活心跳周期（L1 / L2 基准）</label>
             <select class="form-control" id="ecloud-interval">
-              <option value="300">5 分钟 (标准推荐)</option>
+              <option value="60">1 分钟 (高频精细)</option>
+              <option value="180">3 分钟 (精细保活)</option>
+              <option value="300" selected>5 分钟 (标准推荐)</option>
               <option value="600">10 分钟</option>
               <option value="900">15 分钟</option>
               <option value="1800">30 分钟 (极低功耗)</option>
@@ -326,6 +418,7 @@
         <button class="btn btn-primary" id="btn-save-account-pwd" onclick="saveAccount()" style="display: none;">保存天翼云账号</button>
         <button class="btn btn-primary" id="btn-save-account-ydpc" onclick="saveYdpcAccount()" style="display: none;">保存移动爱家账号</button>
         <button class="btn btn-primary" id="btn-save-account-ecloud" onclick="saveEcloudAccount()" style="display: none;">保存移动公众账号</button>
+        <button class="btn btn-primary" id="btn-save-account-teleagent" onclick="saveTeleagentAccount()" style="display: none;">保存星辰云账号</button>
       </div>
     </div>
   </div>
@@ -378,11 +471,11 @@
     </div>
   </div>
 
-  <!-- 自动兑换与抽奖设置模态框 -->
+  <!-- 天翼云自动兑换设置模态框 -->
   <div class="modal-backdrop hidden" id="redeem-modal">
     <div class="modal">
       <div class="modal-header">
-        <h3>🎁 自动兑换与抽奖配置</h3>
+        <h3>🎁 积分自动兑换配置</h3>
         <button class="modal-close" onclick="closeModal('redeem-modal')">&times;</button>
       </div>
       <div class="modal-body">
@@ -399,15 +492,7 @@
         </div>
 
         <div class="form-group">
-          <label>目标操作模式</label>
-          <select class="form-control" id="redeem-target-type" onchange="onTargetTypeChange()">
-            <option value="redeem">积分商城兑换（如长期维持8C16G）</option>
-            <option value="lottery">每日积分幸运抽奖</option>
-          </select>
-        </div>
-
-        <div class="form-group">
-          <label>选择兑换商品 / 抽奖项目</label>
+          <label>选择兑换商品</label>
           <select class="form-control" id="redeem-product-select" onchange="onProductSelectChange()">
             <!-- 动态加载商城奖品 -->
           </select>
@@ -485,8 +570,8 @@
       </div>
       <div class="modal-body">
         <input type="hidden" id="power-acc-id">
-        <p style="font-size: 13px; color: var(--text-muted); margin-bottom: 2px;">
-          向天翼云下达电源控制指令。执行重启或关机前请确保云电脑内已保存重要数据。
+        <p id="power-modal-desc" style="font-size: 13px; color: var(--text-muted); margin-bottom: 2px;">
+          向云电脑下达电源控制指令。执行重启或关机前请确保云电脑内已保存重要数据。
         </p>
 
         <div class="form-group" style="margin-top: 4px;">
@@ -501,10 +586,11 @@
           <span id="power-desktop-status" style="font-weight: 700; color: #16a34a;">🟢 运行中</span>
         </div>
 
-        <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 6px;">
+        <div id="power-btn-grid" style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-top: 6px;">
           <button class="btn btn-success" id="power-btn-boot" onclick="executePowerAction('poweron')">🟢 开机 / 唤醒</button>
-          <button class="btn btn-warning" onclick="executePowerAction('reboot')">🔄 重启云电脑</button>
-          <button class="btn btn-danger" onclick="executePowerAction('shutdown')">🔴 关机</button>
+          <button class="btn btn-warning" id="power-btn-reboot" onclick="executePowerAction('reboot')">🔄 重启云电脑</button>
+          <button class="btn btn-danger" id="power-btn-shutdown" onclick="executePowerAction('shutdown')">🔴 关机</button>
+          <button class="btn btn-danger hidden" id="power-btn-cancel-queue" onclick="executePowerAction('cancel')">✖ 取消排队</button>
         </div>
       </div>
       <div class="modal-footer">
@@ -513,11 +599,11 @@
     </div>
   </div>
 
-  <!-- 手动积分兑换与抽奖模态框 -->
+  <!-- 手动积分商城兑换模态框 -->
   <div class="modal-backdrop hidden" id="manual-redeem-modal">
     <div class="modal" style="max-width: 540px;">
       <div class="modal-header">
-        <h3>🎁 手动积分兑换 / 幸运抽奖</h3>
+        <h3>🎁 手动积分商城兑换</h3>
         <button class="modal-close" onclick="closeModal('manual-redeem-modal')">&times;</button>
       </div>
       <div class="modal-body">
@@ -528,7 +614,7 @@
         </div>
 
         <div class="form-group">
-          <label>选择兑换商品 / 抽奖奖品</label>
+          <label>选择兑换商品</label>
           <select class="form-control" id="manual-prod-select" onchange="onManualProductChange()">
             <!-- 动态填充 -->
           </select>
@@ -543,7 +629,7 @@
         </div>
 
         <div class="form-group">
-          <label>兑换数量 / 抽奖次数</label>
+          <label>兑换数量</label>
           <input type="number" class="form-control" id="manual-order-times" value="1" min="1" max="100" oninput="updateManualTotalCost()">
           <div class="form-text" id="manual-cost-tip" style="font-weight: 600; color: #d97706; margin-top: 4px;">预计消耗: 500 积分</div>
         </div>
@@ -596,7 +682,7 @@
                 <input type="text" class="form-control" id="cron-hang" placeholder="0 4,6 * * *">
               </div>
               <div class="form-group">
-                <label>自动兑换与抽奖检查 Cron</label>
+                <label>自动兑换检查 Cron</label>
                 <input type="text" class="form-control" id="cron-redeem" placeholder="0 7 * * *">
               </div>
             </div>
@@ -669,6 +755,7 @@
             <option value="pushplus">PushPlus (推送加)</option>
             <option value="bark">Bark (iOS)</option>
             <option value="telegram">Telegram 机器人</option>
+            <option value="discord">Discord 机器人 (Discord Webhook)</option>
           </select>
         </div>
         <div class="form-group" id="group-user-notify-token">
@@ -681,12 +768,15 @@
           <div class="form-text" id="user-notify-secret-hint">若机器人在钉钉中开启了【加签】安全设置，请在此填写以 SEC 开头的密钥（或直接拼在 Webhook 地址后）；若仅使用关键词或无安全设置请留空。</div>
         </div>
         <div class="form-group">
-          <label>自定义通知标题模板 (留空默认)</label>
-          <input type="text" class="form-control" id="user-notify-title-tpl" placeholder="{title} - {account}">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+            <label style="margin-bottom:0;">自定义通知标题模板</label>
+            <button type="button" class="btn btn-sm" style="padding:2px 8px; font-size:11px;" onclick="resetUserNotifyTemplates()">🔄 恢复默认模板</button>
+          </div>
+          <input type="text" class="form-control" id="user-notify-title-tpl" placeholder="{account} - {title}">
         </div>
         <div class="form-group">
-          <label>自定义通知内容模板 (留空默认)</label>
-          <textarea class="form-control" id="user-notify-content-tpl" rows="2" placeholder="{content}"></textarea>
+          <label>自定义通知内容模板</label>
+          <textarea class="form-control" id="user-notify-content-tpl" rows="6" placeholder="{time}&#10;&#10;{account}&#10;&#10;{task} - {status}&#10;&#10;{content}"></textarea>
           <div class="form-text">支持插值变量：<code>{title}</code>、<code>{content}</code>、<code>{account}</code>、<code>{task}</code>、<code>{status}</code>、<code>{time}</code></div>
         </div>
         <div style="display:flex; justify-content:flex-end; margin-top:4px;">
@@ -696,6 +786,95 @@
       <div class="modal-footer">
         <button class="btn" onclick="closeModal('user-notify-modal')">取消</button>
         <button class="btn btn-primary" onclick="saveUserNotify()">保存个人推送设置</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 天翼云电脑单机自定义任务 Cron 规则模态框（独立入口，不在编辑账号/重新验证内） -->
+  <div class="modal-backdrop hidden" id="ctyun-desktop-cron-modal">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="ctyun-dcron-title">⏰ 单台天翼云电脑自定义任务 Cron 规则</h3>
+        <button class="modal-close" onclick="closeModal('ctyun-desktop-cron-modal')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="ctyun-dcron-acc-id">
+        <input type="hidden" id="ctyun-dcron-desktop-id">
+        <p style="font-size: 12.5px; color: var(--text-muted); margin-bottom: 10px; line-height: 1.5;">
+          为目标云电脑 <b id="ctyun-dcron-desktop-name" style="color:#0f172a;">—</b> 配置独立任务 Cron（北京时间 5 段表达式：<code>分 时 日 月 周</code>）。留空的分项将自动继承全局调度设置。
+        </p>
+        <div class="form-group">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: #f8fafc; border: 1px solid var(--border); border-radius: 6px;">
+            <span style="font-size: 13px; font-weight: 600; color: #0f172a;">启用本机自定义任务 Cron 规则</span>
+            <label class="switch">
+              <input type="checkbox" id="ctyun-dcron-enabled" onchange="toggleCtyunDesktopCronInputs(this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div id="ctyun-dcron-inputs">
+          <div class="form-group">
+            <label>每日签到打卡 Cron</label>
+            <input type="text" class="form-control" id="ctyun-dcron-sign" placeholder="例如：0 2 * * * (留空继承全局)">
+          </div>
+          <div class="form-group">
+            <label>AI 智能对话积分 Cron</label>
+            <input type="text" class="form-control" id="ctyun-dcron-aichat" placeholder="例如：15 3,20 * * * (留空继承全局)">
+          </div>
+          <div class="form-group">
+            <label>云电脑挂机 1 小时 Cron</label>
+            <input type="text" class="form-control" id="ctyun-dcron-hang" placeholder="例如：30 4,6 * * * (留空继承全局)">
+          </div>
+          <div class="form-group">
+            <label>自动兑换检查 Cron</label>
+            <input type="text" class="form-control" id="ctyun-dcron-redeem" placeholder="例如：0 7 * * * (留空继承全局)">
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal('ctyun-desktop-cron-modal')">取消</button>
+        <button class="btn btn-primary" onclick="saveCtyunDesktopCron()">保存单机 Cron 规则</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 天翼星辰（TeleAgent）每日积分任务独立触发器模态框 -->
+  <div class="modal-backdrop hidden" id="teleagent-sign-cron-modal">
+    <div class="modal" style="max-width: 480px;">
+      <div class="modal-header">
+        <h3>⏰ 天翼星辰积分任务独立触发器</h3>
+        <button class="modal-close" onclick="closeModal('teleagent-sign-cron-modal')">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="ta-scron-acc-id">
+        <p style="font-size: 12.5px; color: var(--text-muted); margin-bottom: 10px; line-height: 1.5;">
+          为账号 <b id="ta-scron-acc-name" style="color:#0f172a;">—</b> 配置每日登录积分任务（+100 积分）的独立 Cron 触发器（北京时间 5 段表达式：<code>分 时 日 月 周</code>）。未启用或留空时自动继承全局调度设置。
+        </p>
+        <div class="form-group">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; background: #f8fafc; border: 1px solid var(--border); border-radius: 6px;">
+            <span style="font-size: 13px; font-weight: 600; color: #0f172a;">启用独立积分任务 Cron 触发器</span>
+            <label class="switch">
+              <input type="checkbox" id="ta-scron-enabled" onchange="toggleTeleagentSignCronInputs(this.checked)">
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+        <div id="ta-scron-inputs">
+          <div class="form-group">
+            <label>每日积分签到 Cron 表达式</label>
+            <input type="text" class="form-control" id="ta-scron-expr" placeholder="例如：15 8 * * * (每天 08:15)">
+          </div>
+          <div style="display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px;">
+            <button type="button" class="btn btn-sm" onclick="applyTeleagentSignCronPreset('15 8 * * *')">08:15</button>
+            <button type="button" class="btn btn-sm" onclick="applyTeleagentSignCronPreset('30 9 * * *')">09:30</button>
+            <button type="button" class="btn btn-sm" onclick="applyTeleagentSignCronPreset('0 12 * * *')">12:00</button>
+            <button type="button" class="btn btn-sm" onclick="applyTeleagentSignCronPreset('0 21 * * *')">21:00</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" onclick="closeModal('teleagent-sign-cron-modal')">取消</button>
+        <button class="btn btn-primary" onclick="saveTeleagentSignCron()">保存触发器规则</button>
       </div>
     </div>
   </div>
@@ -899,7 +1078,7 @@
       <div>云电脑可视化全功能多账号管理平台 · 纯协议超轻量架构</div>
       <div style="margin-top: 6px;" id="footer-version-container">
         <span id="footer-version-badge" style="color: var(--text-muted); cursor: default;">
-          📌 当前版本: v2.3.1
+          📌 当前版本: v2.4.0
         </span>
       </div>
     </footer>
@@ -909,15 +1088,29 @@
   <div class="modal-backdrop hidden" id="release-notes-modal">
     <div class="modal" style="max-width: 650px; max-height: 85vh; display: flex; flex-direction: column;">
       <div class="modal-header">
-        <h3>🚀 版本更新说明 (v2.3.1)</h3>
+        <h3>🚀 版本更新说明 (v2.4.0)</h3>
         <button class="modal-close" onclick="closeModal('release-notes-modal')">&times;</button>
       </div>
       <div class="modal-body" style="font-size: 13px; line-height: 1.7; color: #334155; overflow-y: auto; max-height: calc(85vh - 120px); display: flex; flex-direction: column; gap: 16px;">
-        
+
+        <!-- v2.4.0 -->
+        <div style="background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 8px; padding: 12px 16px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #c7d2fe; padding-bottom: 6px;">
+            <div style="font-weight: 700; color: #4338ca; font-size: 14.5px;">✨ v2.4.0 天翼星辰融合 · 天翼云自愈守护防误报 · Discord 通知 · 多架构容器优化 (最新)</div>
+            <div style="color: #64748b; font-size: 12px;">发布时间：2026-11-26</div>
+          </div>
+          <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">
+            <li><b>🌟 天翼星辰（TeleAgent）四平台全量接入</b>：支持官方扫码登录与账密续期、多实例并行保活隔离、精细 1 分钟/3 分钟保活周期、每日登录积分自动签到与独立 Cron 触发器；卡片交互对标天翼云（运行状态后直达打开、开机/重启迁入统一电源管理弹窗防误触）。</li>
+            <li><b>🛡️ 天翼云自动开机守护与防误报升级</b>：统一前后端五态归一化（运行中/休眠中/启动中/已关机/状态未知）；新增连续 3 次 + 持续 3 分钟防抖观察期 + 独立只读 <code>status</code> 视讯通道交叉核验，避免单次瞬态抖动误判；支持单机 7 档保活周期（30s~30m）与独立 Cron 触发器，同步脉冲旁观 <code>code=1005</code> 正常回收日志降噪。</li>
+            <li><b>🔔 Discord Webhook 通知 & 统一默认模板</b>：新增 Discord Embed 卡片推送兼容，并内置默认标题与内容模板；强化日志体积限容与一键前后端清屏。</li>
+            <li><b>🐳 多架构容器与部署安全加固</b>：支持 <code>linux/amd64</code> 与 <code>linux/arm64</code> 自动构建；Docker Compose 默认启用 <code>network_mode: "bridge"</code> 且端口绑定 <code>127.0.0.1</code>。</li>
+          </ul>
+        </div>
+
         <!-- v2.3 -->
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 8px; padding: 12px 16px;">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; border-bottom: 1px solid #dbeafe; padding-bottom: 6px;">
-            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.3 移动公众全量融合 · 移动爱家 SCG 底座打通与开机能力恢复 · 自动开机守护默认开启 (最新)</div>
+            <div style="font-weight: 700; color: #1d4ed8; font-size: 14.5px;">✨ v2.3 移动公众全量融合 · 移动爱家 SCG 底座打通与开机能力恢复 · 自动开机守护默认开启</div>
             <div style="color: #64748b; font-size: 12px;">发布时间：2026-09-28</div>
           </div>
           <ul style="padding-left: 18px; display: flex; flex-direction: column; gap: 6px; margin: 0;">

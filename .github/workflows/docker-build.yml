@@ -23,11 +23,9 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
-      # 移动公众协议侧车的运行时依赖：回归测试里有一批**真实拉起侧车**的断言，
-      # 缺了这些包（曾经的 ModuleNotFoundError: No module named 'Crypto'）会让侧车级
-      # 断言退化成"只验证未就绪"，闸门形同虚设 —— 与 Dockerfile 保持一致装齐。
+      # 移动公众协议侧车的运行时依赖：确保回归测试可真实拉起侧车完成完整验证
       - name: Set up Python (sidecar runtime)
         uses: actions/setup-python@v5
         with:
@@ -42,13 +40,16 @@ jobs:
       - name: Regression invariants
         run: node tests/regression.test.js
 
-      - name: Set up QEMU (for multi-arch)
+      # 配置多架构模拟（ARM64 + AMD64）与 Buildx 构建器
+      - name: Set up QEMU (for linux/amd64 & linux/arm64)
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 1. 登录 GitHub Packages (GHCR)
+      # 1. 登录 GitHub Container Registry (GHCR)
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -56,44 +57,51 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 2. 登录 Docker Hub (明确绑定账号 learycn，支持 LEARYCN / DOCKERHUB_TOKEN 等 Secret)
+      # 2. 可选登录 Docker Hub（仅在配置 DOCKERHUB_USERNAME 与 DOCKERHUB_TOKEN 时启用）
       - name: Log in to Docker Hub
         id: dockerhub-login
         continue-on-error: true
         env:
-          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME || 'learycn' }}
-          DOCKER_PASS: ${{ secrets.LEARYCN || secrets.DOCKERHUB_TOKEN || secrets.DOCKER_PASSWORD }}
-        if: env.DOCKER_PASS != ''
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKER_PASS: ${{ secrets.DOCKERHUB_TOKEN || secrets.DOCKER_PASSWORD }}
+        if: env.DOCKER_USER != '' && env.DOCKER_PASS != ''
         uses: docker/login-action@v3
         with:
           username: ${{ env.DOCKER_USER }}
           password: ${{ env.DOCKER_PASS }}
 
-      # 3. 动态配置镜像目标列表 (推送至 learycn/ctyun-dashboard 与 ghcr.io/muyicn/ctyun-dashboard)
+      # 3. 组装目标镜像列表（GHCR 自动转小写，避免大写用户名报错）
       - name: Determine Docker images
         id: image-targets
+        env:
+          DOCKER_USER: ${{ secrets.DOCKERHUB_USERNAME }}
+          REPO_NAME: ${{ github.event.repository.name }}
         run: |
-          IMAGES="ghcr.io/${{ github.repository }}"
-          if [ "${{ steps.dockerhub-login.outcome }}" = "success" ]; then
+          REPO_LOWER="$(echo "${GITHUB_REPOSITORY}" | tr '[:upper:]' '[:lower:]')"
+          IMAGES="ghcr.io/${REPO_LOWER}"
+          if [ "${{ steps.dockerhub-login.outcome }}" = "success" ] && [ -n "${DOCKER_USER}" ]; then
+            USER_LOWER="$(echo "${DOCKER_USER}" | tr '[:upper:]' '[:lower:]')"
+            NAME_LOWER="$(echo "${REPO_NAME}" | tr '[:upper:]' '[:lower:]')"
             IMAGES="${IMAGES}
-          learycn/ctyun-dashboard"
+          ${USER_LOWER}/${NAME_LOWER}"
           fi
-          echo "images<<EOF" >> $GITHUB_OUTPUT
-          echo "$IMAGES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "images<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$IMAGES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
 
-      # 4. 提取镜像元数据与多架构标签
+      # 4. 提取镜像元数据与多架构标签（main 分支和 v* 标签同步更新 latest）
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ steps.image-targets.outputs.images }}
           tags: |
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
             type=ref,event=branch
             type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
 
-      # 5. 构建多架构镜像 (linux/amd64, linux/arm64) 并推送
+      # 5. 构建并推送多架构镜像 (linux/amd64, linux/arm64)
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -102,5 +110,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NPM_REGISTRY=https://registry.npmjs.org
+            PIP_INDEX_URL=https://pypi.org/simple
           cache-from: type=gha
           cache-to: type=gha,mode=max

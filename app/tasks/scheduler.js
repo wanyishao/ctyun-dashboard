@@ -68,6 +68,8 @@ class TaskScheduler {
     this.lastTriggerMinute = '';
     this.lastCompletedDate = '';
     this.isRunning = false;
+    // 单台天翼云电脑自定义 Cron 分钟级去重记录（accId:desktopId:taskType -> YYYY-MM-DDTHH:mm）
+    this._desktopCronTriggered = new Map();
   }
 
   /**
@@ -133,6 +135,13 @@ class TaskScheduler {
     let anyUngovernedTask = false;
     for (const acc of accounts) {
       if (!acc.enabled || acc.platform === 'ydpc' || acc.platform === 'ecloud') continue;
+      if (acc.platform === 'teleagent') {
+        if (this.taskGate(acc, 'sign') && !subCronMap.sign && !this.isTeleagentSignGovernedByAccountCron(acc)) {
+          anyUngovernedTask = true;
+          break;
+        }
+        continue;
+      }
       const f = acc.features || {};
       if ((this.taskGate(acc, 'sign') && !subCronMap.sign) ||
           (this.taskGate(acc, 'aiChat') && !subCronMap.aiChat) ||
@@ -153,6 +162,17 @@ class TaskScheduler {
       if (!acc.enabled) continue;
       if (acc.platform === 'ydpc') continue; // 移动云保活为常态巡检，无需达成度判定
       if (acc.platform === 'ecloud') continue; // 移动公众保活为常态巡检，无官方任务达成度可言
+      if (acc.platform === 'teleagent') {
+        if (this.taskGate(acc, 'sign') && !subCronMap.sign && !this.isTeleagentSignGovernedByAccountCron(acc)) {
+          const client = this.getClient(acc);
+          try { await client.refreshPointsAndTasks(); } catch (e) { /* 查询失败按未达成处理 */ }
+          if (!client?.metrics?.signedToday) {
+            allDone = false;
+            break;
+          }
+        }
+        continue;
+      }
       const f = acc.features || {};
       const client = this.getClient(acc);
       try {
@@ -301,11 +321,123 @@ class TaskScheduler {
   }
 
   /**
+   * 检查并触发天翼云电脑单机自定义 Cron 规则（与全局主调度 / 分项 Cron 并存，单机配置优先管辖该机对应分项）。
+   * 仅针对 platform 为天翼云（非 ydpc/ecloud/teleagent）且 desktop.customCron.enabled === true 的机器。
+   */
+  runDesktopCustomCrons(bj, currentMinKey) {
+    const accounts = (this.getAccounts() || []).filter(
+      a => a.enabled && a.platform !== 'ydpc' && a.platform !== 'ecloud' && a.platform !== 'teleagent'
+    );
+    const taskDefs = [
+      { key: 'sign', cronField: 'signCron', label: '签到打卡' },
+      { key: 'aiChat', cronField: 'aiChatCron', label: 'AI 对话' },
+      { key: 'cloudHang', cronField: 'cloudHangCron', label: '云电脑挂机' },
+      { key: 'redeem', cronField: 'redeemCron', label: '自动兑换' },
+    ];
+    for (const acc of accounts) {
+      const desktops = Array.isArray(acc.desktops) ? acc.desktops : [];
+      if (!desktops.length) continue;
+      for (const d of desktops) {
+        const cc = d && d.customCron;
+        if (!cc || cc.enabled !== true) continue;
+        const dId = String(d.desktopId || d.objId || '');
+        const dName = d.desktopName || dId || '云电脑';
+        for (const td of taskDefs) {
+          const expr = String(cc[td.cronField] || '').trim();
+          if (!expr) continue;
+          if (!shouldRunCron(expr, bj)) continue;
+          const dedupKey = `${acc.id}:${dId}:${td.key}`;
+          if (this._desktopCronTriggered.get(dedupKey) === currentMinKey) continue;
+          this._desktopCronTriggered.set(dedupKey, currentMinKey);
+
+          const client = this.getClient(acc);
+          if (td.key === 'redeem') {
+            if (acc.features?.autoRedeem) {
+              this.appendLog('Scheduler', `⏰ [${acc.name}] 单机 [${dName}] 触发自定义 Cron [${td.label}] (${expr})`, 'info', acc.name, 'ctyun');
+              client.getRewards().catch(() => {});
+            }
+            continue;
+          }
+          const gate = (client && typeof client.resolveTask === 'function')
+            ? client.resolveTask(td.key, d).enabled
+            : (this.taskGate(acc, td.key, client) && d.taskEnabled !== false);
+          if (!gate) continue;
+
+          this.appendLog('Scheduler', `⏰ [${acc.name}] 单机 [${dName}] 触发自定义 Cron [${td.label}] (${expr})`, 'info', acc.name, 'ctyun');
+          if (td.key === 'sign') {
+            executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl))
+              .then(signRes => {
+                if (signRes && signRes.isCompleted) {
+                  acc.stats = acc.stats || {};
+                  acc.stats.lastSignTime = getBeijingTimeString();
+                  this.saveConfig();
+                }
+              })
+              .catch(() => {});
+          } else if (td.key === 'aiChat') {
+            executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+          } else if (td.key === 'cloudHang') {
+            executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
+          }
+        }
+      }
+    }
+  }
+
+  /** 判断某 TeleAgent 账号的每日积分签到是否由账号独立自定义 Cron 管辖 */
+  isTeleagentSignGovernedByAccountCron(acc) {
+    if (!acc || acc.platform !== 'teleagent') return false;
+    return !!(acc.customCron && acc.customCron.enabled === true && String(acc.customCron.signCron || '').trim());
+  }
+
+  /** 检查并触发 TeleAgent 账号级独立积分任务 Cron 规则（与全局主调度/分项 Cron 隔离，按分钟去重） */
+  runTeleagentCustomCrons(bj, currentMinKey) {
+    const accounts = (this.getAccounts() || []).filter(a => a.enabled && a.platform === 'teleagent');
+    for (const acc of accounts) {
+      if (!this.isTeleagentSignGovernedByAccountCron(acc)) continue;
+      const expr = String(acc.customCron.signCron || '').trim();
+      if (!expr || !shouldRunCron(expr, bj)) continue;
+      const dedupKey = `${acc.id}:teleagent:sign`;
+      if (this._desktopCronTriggered.get(dedupKey) === currentMinKey) continue;
+      this._desktopCronTriggered.set(dedupKey, currentMinKey);
+
+      const client = this.getClient(acc);
+      if (!this.taskGate(acc, 'sign', client)) continue;
+      this.appendLog('Scheduler', `⏰ [${acc.name}] TeleAgent 触发独立积分任务 Cron (${expr})`, 'info', acc.name, 'teleagent');
+      client.runDailySign({ trigger: 'custom_cron' }).catch(() => {});
+    }
+  }
+
+  /** 判断某天翼云账号的某个任务分项是否全部由单机自定义 Cron 管辖（用于避免主调度重复触发） */
+  isAccountTaskGovernedByDesktopCron(acc, taskKey) {
+    if (!acc || acc.platform === 'ydpc' || acc.platform === 'ecloud' || acc.platform === 'teleagent') return false;
+    const fieldMap = { sign: 'signCron', aiChat: 'aiChatCron', cloudHang: 'cloudHangCron', redeem: 'redeemCron' };
+    const cronField = fieldMap[taskKey];
+    if (!cronField) return false;
+    const desktops = (Array.isArray(acc.desktops) ? acc.desktops : []).filter(d => d && d.taskEnabled !== false);
+    if (!desktops.length) return false;
+    return desktops.every(d => d.customCron && d.customCron.enabled === true && !!String(d.customCron[cronField] || '').trim());
+  }
+
+  /**
    * 30 秒巡检看门狗：负责准点分钟匹配、高级 Cron 触发以及热更新重调度
    */
   async heartbeatTick() {
     const bj = getBeijingDate();
     const currentMinKey = bj.toISOString().substring(0, 16); // YYYY-MM-DDTHH:mm
+
+    // 0. 优先独立巡检天翼云单机自定义 Cron 与 TeleAgent 账号独立积分任务 Cron（按分钟去重）
+    try {
+      this.runDesktopCustomCrons(bj, currentMinKey);
+    } catch (e) {
+      this.appendLog('Scheduler', `⚠️ 单机自定义 Cron 巡检异常: ${e.message}`, 'warning');
+    }
+    try {
+      this.runTeleagentCustomCrons(bj, currentMinKey);
+    } catch (e) {
+      this.appendLog('Scheduler', `⚠️ TeleAgent 自定义积分 Cron 巡检异常: ${e.message}`, 'warning');
+    }
+
     if (this.lastTriggerMinute === currentMinKey) return;
 
     const currentHm = `${String(bj.getHours()).padStart(2, '0')}:${String(bj.getMinutes()).padStart(2, '0')}`;
@@ -341,8 +473,37 @@ class TaskScheduler {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [签到打卡] (Cron: ${cron.signCron})...`, 'info');
         for (const acc of accounts) {
+          if (acc.platform === 'ydpc' || acc.platform === 'ecloud') continue;
+          if (this.isAccountTaskGovernedByDesktopCron(acc, 'sign')) continue;
+          if (this.isTeleagentSignGovernedByAccountCron(acc)) continue;
           if (this.taskGate(acc, 'sign')) {
             const client = this.getClient(acc);
+            if (acc.platform === 'teleagent') {
+              client.runDailySign({ trigger: 'sub_cron' }).catch(() => {});
+            } else {
+              executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl))
+                .then(signRes => {
+                  if (signRes && signRes.isCompleted) {
+                    acc.stats.lastSignTime = getBeijingTimeString();
+                    this.saveConfig();
+                  }
+                })
+                .catch(() => {});
+            }
+          }
+        }
+      }
+    } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
+      // 辅助规则未配置该项，按主时间点兜底
+      for (const acc of accounts) {
+        if (acc.platform === 'ydpc' || acc.platform === 'ecloud') continue;
+        if (this.isAccountTaskGovernedByDesktopCron(acc, 'sign')) continue;
+        if (this.isTeleagentSignGovernedByAccountCron(acc)) continue;
+        if (this.taskGate(acc, 'sign')) {
+          const client = this.getClient(acc);
+          if (acc.platform === 'teleagent') {
+            client.runDailySign({ trigger: 'scheduled_fallback' }).catch(() => {});
+          } else {
             executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl))
               .then(signRes => {
                 if (signRes && signRes.isCompleted) {
@@ -354,21 +515,6 @@ class TaskScheduler {
           }
         }
       }
-    } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
-      // 辅助规则未配置该项，按主时间点兜底
-      for (const acc of accounts) {
-        if (this.taskGate(acc, 'sign')) {
-          const client = this.getClient(acc);
-          executeNativeSign(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl))
-            .then(signRes => {
-              if (signRes && signRes.isCompleted) {
-                acc.stats.lastSignTime = getBeijingTimeString();
-                this.saveConfig();
-              }
-            })
-            .catch(() => {});
-        }
-      }
     }
 
     // 2.2 AI 智能对话分项规则
@@ -377,6 +523,8 @@ class TaskScheduler {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [AI 对话] (Cron: ${cron.aiChatCron})...`, 'info');
         for (const acc of accounts) {
+          if (acc.platform === 'ydpc' || acc.platform === 'ecloud' || acc.platform === 'teleagent') continue;
+          if (this.isAccountTaskGovernedByDesktopCron(acc, 'aiChat')) continue;
           if (this.taskGate(acc, 'aiChat')) {
             const client = this.getClient(acc);
             executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
@@ -386,6 +534,7 @@ class TaskScheduler {
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底
       for (const acc of accounts) {
+        if (acc.platform === 'ydpc' || acc.platform === 'ecloud' || acc.platform === 'teleagent') continue;
         if (this.taskGate(acc, 'aiChat')) {
           const client = this.getClient(acc);
           executeNativeAiChat(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
@@ -399,6 +548,8 @@ class TaskScheduler {
         this.lastTriggerMinute = currentMinKey;
         this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [云电脑挂机] (Cron: ${cron.cloudHangCron})...`, 'info');
         for (const acc of accounts) {
+          if (acc.platform === 'ydpc' || acc.platform === 'ecloud' || acc.platform === 'teleagent') continue;
+          if (this.isAccountTaskGovernedByDesktopCron(acc, 'cloudHang')) continue;
           if (this.taskGate(acc, 'cloudHang')) {
             const client = this.getClient(acc);
             executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
@@ -408,19 +559,20 @@ class TaskScheduler {
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底
       for (const acc of accounts) {
-        if (this.taskGate(acc, 'cloudHang') && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
+        if (this.taskGate(acc, 'cloudHang') && acc.platform !== 'ydpc' && acc.platform !== 'ecloud' && acc.platform !== 'teleagent') {
           const client = this.getClient(acc);
           executeNativeHang(client, acc, (src, msg, lvl) => this.appendLog(src, `[${acc.name}] ${msg}`, lvl)).catch(() => {});
         }
       }
     }
 
-    // 2.4 自动兑换与抽奖分项规则
+    // 2.4 自动兑换分项规则
     if (cron.redeemCron?.trim()) {
       if (shouldRunCron(cron.redeemCron.trim(), bj)) {
         this.lastTriggerMinute = currentMinKey;
-        this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [自动兑换/抽奖] (Cron: ${cron.redeemCron})...`, 'info');
+        this.appendLog('Scheduler', `⏰ 触发分项辅助规则 [自动兑换] (Cron: ${cron.redeemCron})...`, 'info');
         for (const acc of accounts) {
+          if (acc.platform === 'ydpc' || acc.platform === 'ecloud' || acc.platform === 'teleagent') continue;
           if (acc.features?.autoRedeem) {
             const client = this.getClient(acc);
             client.getRewards().catch(() => {});
@@ -430,7 +582,7 @@ class TaskScheduler {
     } else if (targetTimes.includes(currentHm) && this.lastCompletedDate !== todayStr) {
       // 辅助规则未配置该项，按主时间点兜底 (兑换仍受自身策略日限制约，由完整流程内判定)
       for (const acc of accounts) {
-        if (acc.features?.autoRedeem && acc.platform !== 'ydpc' && acc.platform !== 'ecloud') {
+        if (acc.features?.autoRedeem && acc.platform !== 'ydpc' && acc.platform !== 'ecloud' && acc.platform !== 'teleagent') {
           const client = this.getClient(acc);
           client.getRewards().catch(() => {});
         }
@@ -528,6 +680,40 @@ class TaskScheduler {
         // 账号间防风控随机退避
         if (i < accounts.length - 1) {
           const jitterMs = Math.floor(Math.random() * 8000) + 3000;
+          await new Promise(r => setTimeout(r, jitterMs));
+        }
+        continue;
+      }
+
+      // 天翼星辰（TeleAgent）独立调度分支
+      // ----------------------------------------------------------
+      // 保活看护由 TeleagentClient 自己的时间轮负责，此处做幂等收敛 + 执行每日登录积分签到。
+      if (acc.platform === 'teleagent') {
+        try {
+          const keepOn = this.taskGate(acc, 'keepAlive', client);
+          if (keepOn && !client.workerRunning) {
+            this.appendLog('Scheduler', `[${acc.name}] 天翼星辰保活看护未在运行，正在拉起...`, 'info', acc.name, 'teleagent');
+            client.startKeepAliveWorker();
+          } else if (!keepOn && client.workerRunning) {
+            this.appendLog('Scheduler', `[${acc.name}] 天翼星辰账号级保活已关闭，停止看护循环`, 'info', acc.name, 'teleagent');
+            client.stopKeepAliveWorker();
+          }
+          if (this.taskGate(acc, 'sign', client)) {
+            if (excludeSet?.sign || (reason !== 'manual_trigger' && this.isTeleagentSignGovernedByAccountCron(acc))) {
+              this.appendLog('Scheduler', `[${acc.name}] 分项 [每日签到] 由独立 Cron 管辖，本次主调度跳过。`, 'info', acc.name, 'teleagent');
+            } else {
+              const signRes = await client.runDailySign({ trigger: reason });
+              if (signRes && signRes.isCompleted) {
+                accSummary.sign = true;
+              }
+            }
+          }
+        } catch (err) {
+          this.appendLog('Scheduler', `[${acc.name}] 天翼星辰定时巡检异常: ${err.message}`, 'error', acc.name, 'teleagent');
+        }
+
+        if (i < accounts.length - 1) {
+          const jitterMs = Math.floor(Math.random() * 6000) + 2000;
           await new Promise(r => setTimeout(r, jitterMs));
         }
         continue;
@@ -767,7 +953,14 @@ class TaskScheduler {
     // 严格判定：只有当所有账号已开启的全部任务（包括挂机满 1 小时）都真正达成时，才标记今日流程圆满完成
     let allAccountsFullyDone = true;
     for (const acc of accounts) {
+      if (acc.platform === 'ydpc' || acc.platform === 'ecloud') continue;
       const client = this.getClient(acc);
+      if (acc.platform === 'teleagent') {
+        if (this.taskGate(acc, 'sign', client) && !this.isTeleagentSignGovernedByAccountCron(acc) && !client?.metrics?.signedToday) {
+          allAccountsFullyDone = false;
+        }
+        continue;
+      }
       const tasks = client?.metrics?.officialTasks || [];
       const loginTask = tasks.find(t => t.name.includes('登录AI云电脑'));
       const aiTask = tasks.find(t => t.name.includes('AI对话'));

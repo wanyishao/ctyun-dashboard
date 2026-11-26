@@ -2463,10 +2463,11 @@ test('平台视图 Tab 必须按"实际出现的平台"显隐（三平台并存�
     '平台视图 Tab 的显隐必须以"平台数 >= 2"为准，不得写死 hasCtyun && hasYdpc'
   );
   assert.ok(
-    /const tabBtnMap = \{ ctyun: 'view-tab-ctyun', ydpc: 'view-tab-ydpc', ecloud: 'view-tab-ecloud' \}/.test(appJs),
-    '三个平台 tab 必须逐个按 presence 显隐（避免出现点了没内容的空 Tab）'
+    /const tabBtnMap = \{ ctyun: 'view-tab-ctyun', ydpc: 'view-tab-ydpc', ecloud: 'view-tab-ecloud', teleagent: 'view-tab-teleagent' \}/.test(appJs),
+    '四个平台 tab 必须逐个按 presence 显隐（避免出现点了没内容的空 Tab）'
   );
   assert.ok(/id="view-tab-ecloud"/.test(indexHtml), '必须有移动公众的视图切换 Tab');
+  assert.ok(/id="view-tab-teleagent"/.test(indexHtml), '必须有天翼星辰的视图切换 Tab');
 });
 
 test('登录 UI 必须与另两平台区分：移动公众走「账号+密码 → 短信验证」两段式', () => {
@@ -2917,6 +2918,7 @@ test('三平台「当前动作」后的动作文字必须显式 11.5px，不得�
 
   const cases = [
     ['移动爱家（ydpc）', 'title="${escapeHtml(view.actionText || \'\')}"'],
+    ['天翼星辰（teleagent）', 'title="${escapeHtml(taActionText)}"'],
     ['移动公众（ecloud）', 'title="${escapeHtml(actionText)}"'],
     ['天翼云（ctyun）', 'id="acc-hb-text-'],
   ];
@@ -2931,13 +2933,13 @@ test('三平台「当前动作」后的动作文字必须显式 11.5px，不得�
     );
   }
 
-  // 对照项：标签侧三处都仍是 11.5px，防止"把标签也一起改大"来糊弄本断言
+  // 对照项：标签侧四处都仍是 11.5px，防止"把标签也一起改大"来糊弄本断言
   const labelHits = appJs.match(
     /<span style="flex-shrink: 0; font-size: 11\.5px; color: #64748b;">当前动作:<\/span>/g
   ) || [];
   assert.ok(
-    labelHits.length === 3,
-    `三平台的「当前动作:」标签都必须保持 11.5px，现匹配到 ${labelHits.length} 处`
+    labelHits.length === 4,
+    `四平台的「当前动作:」标签都必须保持 11.5px，现匹配到 ${labelHits.length} 处`
   );
 });
 
@@ -3299,6 +3301,7 @@ test('监视板块的主机名必须显式声明 12px（不得继承 16px 浏览
   const cases = [
     ['移动爱家监视行', 'vmName'],
     ['移动公众监视行', 'name'],
+    ['天翼星辰监视行', 'taName'],
   ];
   for (const [label, expr] of cases) {
     const re = new RegExp(
@@ -5264,6 +5267,384 @@ testAsync('行为：pingCag 对 SCG 机与材料缺失机必须"返回未执行"
     '必须点明"材料未下发"，不能伪装成网络故障'
   );
   assert.strictEqual(firmAuthCalls, 1, '材料判定必须紧跟在取材料之后、在拨号之前');
+});
+
+// ============================================================================
+// 组 35 · 天翼星辰（TeleAgent）云 Windows 兼容：协议 / 隔离 / 保活 / 签到 / UI
+// ============================================================================
+group('组 35 · 天翼星辰（TeleAgent）云 Windows 兼容与四平台隔离');
+
+const taProtoCode = stripComments(read('app/teleagent/teleagent_protocol.js'));
+const taClientCode = stripComments(read('app/teleagent/teleagent_client.js'));
+const taProto = require(path.join(ROOT, 'app/teleagent/teleagent_protocol.js'));
+const { TeleagentClient, LOG_SOURCE: TA_LOG_SRC, buildTeleagentDefaultFeatures } = require(path.join(ROOT, 'app/teleagent/teleagent_client.js'));
+
+test('四平台机制隔离：teleagent 模块不得复用 ctyun / ydpc / ecloud 或反向依赖 server.js', () => {
+  for (const [label, src] of [['teleagent_protocol.js', taProtoCode], ['teleagent_client.js', taClientCode]]) {
+    assert.ok(
+      !/require\([^)]*(ydpc|ecloud|ctyun_encryption|soho_client|cag_boot|server\.js)[^)]*\)/.test(src),
+      `${label} 不得跨平台 require 其他云平台或 server.js`
+    );
+    assert.ok(
+      !/rejectUnauthorized\s*:\s*false/.test(src),
+      `${label} 不得关闭 TLS 证书校验`
+    );
+  }
+  assert.ok(/AbortSignal\.timeout\s*\(/.test(taProtoCode), 'teleagent_protocol 必须对网络请求挂载主动超时');
+  assert.strictEqual(TA_LOG_SRC, 'TELEAGENT', 'TeleAgent 日志源必须固定为 TELEAGENT');
+});
+
+test('四平台日志严格分流：TELEAGENT / ECLOUD / SOHO / KeepAlive 互不串台', () => {
+  const { inferLogPlatform } = helpers();
+  assert.strictEqual(inferLogPlatform('TELEAGENT', 'teleagent'), 'teleagent', 'TELEAGENT 必须归入 teleagent 流');
+  const set = new Set([
+    inferLogPlatform('TELEAGENT'),
+    inferLogPlatform('ECLOUD'),
+    inferLogPlatform('SOHO'),
+    inferLogPlatform('KeepAlive'),
+  ]);
+  assert.strictEqual(set.size, 4, '四个平台日志流必须互不相同');
+});
+
+test('行为：TeleAgent Cookie 合并不得被同名空删除 Cookie 抹掉有效 operationToken', () => {
+  const h = new Headers();
+  h.append('set-cookie', 'operationToken=valid-jwt-token; Domain=.teleai.com.cn; Path=/');
+  h.append('set-cookie', 'operationToken=; Domain=agent.teleai.com.cn; Path=/');
+  h.append('set-cookie', 'operationToken=; Path=/');
+  const jar = taProto.mergeCookies({}, h);
+  assert.strictEqual(jar.operationToken, 'valid-jwt-token', '空值删除 Cookie 不得覆盖已获取的 operationToken');
+});
+
+test('行为：TeleAgent 实例状态码归一化与 JWT 解析', () => {
+  assert.strictEqual(taProto.normalizeInstanceStatus(100).powerState, 'on');
+  assert.strictEqual(taProto.normalizeInstanceStatus(4).powerState, 'on');
+  assert.strictEqual(taProto.normalizeInstanceStatus(2).powerState, 'starting');
+  assert.strictEqual(taProto.normalizeInstanceStatus(3).powerState, 'off');
+  assert.strictEqual(taProto.normalizeInstanceStatus(5).powerState, 'queue');
+  assert.strictEqual(taProto.normalizeInstanceStatus(999).powerState, 'unknown');
+
+  const expSec = Math.floor(Date.now() / 1000) + 86400 * 10;
+  const fakeJwt = 'hdr.' + Buffer.from(JSON.stringify({ exp: expSec })).toString('base64url') + '.sig';
+  assert.strictEqual(taProto.parseJwtExp(fakeJwt), expSec, '必须能正确解析 JWT payload.exp');
+  assert.strictEqual(taProto.maskAccount('13812345678'), '138****5678', '手机号日志脱敏必须生效');
+});
+
+test('行为：TeleAgent 默认开关与统一开关判定（保活/签到/自动开机守护解耦）', () => {
+  const { resolveTaskEnabled } = helpers();
+  const def = buildTeleagentDefaultFeatures();
+  assert.strictEqual(def.keepAlive, true);
+  assert.strictEqual(def.autoBoot, true);
+  assert.strictEqual(def.autoSign, true);
+  assert.strictEqual(def.autoRelogin, true);
+
+  const acc = { id: 'ta_u1', platform: 'teleagent', enabled: true, features: { ...def, keepAlive: false } };
+  const client = new TeleagentClient(acc, {
+    resolveTaskEnabled: (a, d, t) => resolveTaskEnabled(a, d, t),
+  });
+  assert.strictEqual(client.resolveTask('keepAlive', null).enabled, false, '账号保活总开关关闭必须生效');
+  assert.strictEqual(client.resolveTask('sign', null).enabled, true, '关闭保活不得误伤每日签到开关');
+  const view = client.describeDesktopKeepAlive({ instanceId: 'i1', powerState: 'on', statusText: '运行中' });
+  assert.strictEqual(view.tone, 'off', '总开关关闭时单机监视视图必须如实呈 off');
+});
+
+test('静态：server.js / scheduler.js / 前端完整接入 TeleAgent（含扫码扩展位与 JWT 加密落盘）', () => {
+  assert.ok(/pathname === '\/api\/accounts\/teleagent\/add'/.test(server), '缺少 /api/accounts/teleagent/add');
+  assert.ok(/pathname === '\/api\/accounts\/teleagent\/keepalive'/.test(server), '缺少 /api/accounts/teleagent/keepalive');
+  assert.ok(/pathname === '\/api\/accounts\/teleagent\/sign'/.test(server), '缺少 /api/accounts/teleagent/sign');
+  assert.ok(/pathname === '\/api\/accounts\/teleagent\/open'/.test(server), '缺少 /api/accounts/teleagent/open');
+  assert.ok(/if \(a\.savedJwt\) a\.savedJwt = decryptPassword\(a\.savedJwt\)/.test(server), 'loadConfig 必须解密 savedJwt');
+  assert.ok(/a\.savedJwt = encryptPassword\(a\.savedJwt\)/.test(server), 'saveConfig 必须加密 savedJwt');
+  assert.ok(/delete safeAcc\.savedJwt/.test(server), '/api/accounts 下发必须脱敏剔除 savedJwt');
+
+  assert.ok(/acc\.platform === 'teleagent'/.test(schedulerCode), 'scheduler 必须包含 teleagent 独立调度分支');
+  assert.ok(/client\.runDailySign\(/.test(schedulerCode), 'scheduler 必须调度 TeleAgent 每日签到');
+
+  assert.ok(/id="platform-tab-teleagent"/.test(indexHtml), '添加账号 Modal 必须包含天翼星辰页签');
+  assert.ok(/id="panel-add-teleagent"/.test(indexHtml), '添加账号 Modal 必须包含天翼星辰面板');
+  assert.ok(/id="ta-login-panel-qr"/.test(indexHtml), '必须预留 TeleAgent 扫码登录独立扩展面板');
+  assert.ok(/id="tab-platform-teleagent"/.test(indexHtml), '日志区必须有天翼星辰平台筛选按钮');
+  assert.ok(/function buildTeleagentDesktopMonitorHtml\(acc\)/.test(appJs), '前端必须有独立的 TeleAgent 监视渲染器');
+  assert.ok(/activePlatformFilter === 'teleagent' && item\.platform !== 'teleagent'/.test(appJs), '日志筛选必须对 teleagent 绝对隔离');
+});
+
+test('精细保活间隔（1 分钟与 3 分钟）：前端弹窗、卡片单机选择与后端精度齐备', () => {
+  for (const id of ['teleagent-interval', 'ecloud-interval', 'ydpc-interval']) {
+    const m = indexHtml.match(new RegExp(`id="${id}"[\\s\\S]*?<\\/select>`));
+    assert.ok(m, `index.html 缺少 #${id} 选择器`);
+    assert.ok(/value="60"/.test(m[0]), `#${id} 必须提供 1 分钟 (60s) 选项`);
+    assert.ok(/value="180"/.test(m[0]), `#${id} 必须提供 3 分钟 (180s) 选项`);
+  }
+  const oneMinMatches = appJs.match(/value="60"[^>]*>⏱️1分钟/g) || [];
+  const threeMinMatches = appJs.match(/value="180"[^>]*>⏱️3分钟/g) || [];
+  assert.ok(oneMinMatches.length >= 4, `前端四平台卡片单机周期均应支持 1 分钟，当前命中 ${oneMinMatches.length}`);
+  assert.ok(threeMinMatches.length >= 4, `前端四平台卡片单机周期均应支持 3 分钟，当前命中 ${threeMinMatches.length}`);
+  const { WORKER_TICK_MS, MIN_KEEPALIVE_SEC } = require(path.join(ROOT, 'app/teleagent/teleagent_client.js'));
+  assert.strictEqual(MIN_KEEPALIVE_SEC, 60, 'TeleAgent 最小保活周期应支持 60s (1 分钟)');
+  assert.ok(WORKER_TICK_MS <= 5000, `TeleAgent 滴答精度应 <= 5s 以支撑 1 分钟精细间隔，当前 ${WORKER_TICK_MS}ms`);
+});
+
+testAsync('行为：TeleAgent 本地预检零多余请求 + 多实例并行隔离 + 401 退避防互踢', async () => {
+  const { resolveTaskEnabled } = helpers();
+  const futureExp = Math.floor(Date.now() / 1000) + 86400 * 20;
+  const fakeJwt = 'hdr.' + Buffer.from(JSON.stringify({ exp: futureExp })).toString('base64url') + '.sig';
+
+  let listCalls = 0;
+  const events = [];
+  const stubProto = {
+    ...taProto,
+    listInstances: async () => {
+      listCalls++;
+      return [
+        { id: 'inst_a', name: '主机A', status: 100 },
+        { id: 'inst_b', name: '主机B', status: 100 },
+      ];
+    },
+    sendInstanceHeartbeat: async (_jwt, iid) => {
+      events.push(`hb_start:${iid}`);
+      if (iid === 'inst_a') await new Promise((r) => setTimeout(r, 120));
+      events.push(`hb_end:${iid}`);
+      return { ok: true, results: { refresh: 'ok', heartbeat: 'ok' } };
+    },
+    connectInstance: async (_jwt, iid) => `https://agent.teleai.com.cn/mock/${iid}`,
+    getUserCenter: async () => ({ balance: 1000, planName: '测试版' }),
+    getDayTask: async () => ({ data: { activity_data: [] } }),
+    getServiceStatus: async () => ({ ok: true }),
+  };
+
+  const acc = {
+    id: 'ta_iso_1',
+    platform: 'teleagent',
+    name: '并发隔离测试号',
+    user: '13800001111',
+    password: 'dummy',
+    savedJwt: fakeJwt,
+    jwtExp: futureExp,
+    keepaliveInterval: 60,
+    enabled: true,
+    features: buildTeleagentDefaultFeatures(),
+    desktops: [
+      { instanceId: 'inst_a', id: 'inst_a', desktopName: '主机A', powerState: 'on', instanceStatus: 100, keepaliveInterval: 60, lastKeepAliveAt: 0 },
+      { instanceId: 'inst_b', id: 'inst_b', desktopName: '主机B', powerState: 'on', instanceStatus: 100, keepaliveInterval: 180, lastKeepAliveAt: 0 },
+    ],
+  };
+
+  const client = new TeleagentClient(acc, {
+    proto: stubProto,
+    resolveTaskEnabled: (a, d, t) => resolveTaskEnabled(a, d, t),
+  });
+  client._lastPointsPollAt = Date.now();
+  client._lastServicePollAt = Date.now();
+
+  // 1) 多实例并行：inst_a 慢 120ms 时，inst_b 必须在其完成前并行结束（不被串行阻塞）
+  const r1 = await client.runKeepAliveOnce({ manual: false });
+  assert.strictEqual(r1.ok, true);
+  assert.strictEqual(r1.acted, true);
+  assert.ok(events.indexOf('hb_end:inst_b') < events.indexOf('hb_end:inst_a'), '实例 B 必须与慢实例 A 并行完成，不得串行阻塞');
+  assert.strictEqual(listCalls, 1, '首轮应只调用 1 次 listInstances');
+
+  // 2) 未到 60s / 180s 时再次自动巡检：本地预检直接跳过，零多余 listInstances 请求
+  const r2 = await client.runKeepAliveOnce({ manual: false });
+  assert.strictEqual(r2.skipped, true, '未到保活周期必须本地直接跳过');
+  assert.strictEqual(listCalls, 1, '未到点时绝不得白发 listInstances 网络请求');
+
+  // 3) 401 防互踢梯度冷却验证
+  const now = Date.now();
+  client._forceReloginHistory = [];
+  const step0 = client.getForceReloginCooldownMs(now);
+  client._forceReloginHistory = [now - 1000];
+  const step1 = client.getForceReloginCooldownMs(now);
+  client._forceReloginHistory = [now - 2000, now - 1000, now - 500];
+  const step3 = client.getForceReloginCooldownMs(now);
+  assert.ok(step0 < step1 && step1 < step3, `401 冷却必须梯度递增防止与并存任务互踢 (${step0} < ${step1} < ${step3})`);
+
+  // 4) 1 分钟 / 3 分钟视图校验
+  const vA = client.describeDesktopKeepAlive(acc.desktops.find((d) => d.instanceId === 'inst_a'));
+  const vB = client.describeDesktopKeepAlive(acc.desktops.find((d) => d.instanceId === 'inst_b'));
+  assert.strictEqual(vA.intervalSec, 60);
+  assert.strictEqual(vB.intervalSec, 180);
+});
+
+test('静态：server.js 与 docker-compose.yml 具备多实例 DATA_DIR 锁与端口/卷隔离能力', () => {
+  assert.ok(/function acquireInstanceLock\(\)/.test(serverCode), 'server.js 必须具备 DATA_DIR 独占实例锁');
+  assert.ok(/CTYUN_DATA_DIR_LOCKED/.test(serverCode), '并发冲突时必须返回明确锁冲突错误码');
+  assert.ok(/const HOST = process\.env\.HOST \|\| '0\.0\.0\.0'/.test(serverCode), 'server.js 必须支持 HOST 环境变量');
+  const compose = read('docker-compose.yml');
+  assert.ok(/image:\s*ghcr\.io\/wanyishao\/ctyun-dashboard:latest/.test(compose), 'docker-compose.yml 必须默认使用公开镜像 ghcr.io/wanyishao/ctyun-dashboard:latest');
+  assert.ok(/127\.0\.0\.1:8571:8571/.test(compose), 'docker-compose.yml 默认端口必须监听在 127.0.0.1:8571');
+  assert.ok(/\.\/data:\/app\/data/.test(compose), 'docker-compose.yml 必须挂载持久化数据卷 ./data:/app/data');
+  assert.ok(/container_name:\s*ctyun-dashboard/.test(compose), 'docker-compose.yml 必须直接声明容器名');
+  assert.ok(!/\$\{/.test(compose), 'docker-compose.yml 不应依赖 .env 变量占位符');
+});
+
+test('静态：TeleAgent 卡片尺寸/2x2按钮优化、扫码登录路由与防自动拉取登录交互', () => {
+  assert.ok(!/看本平台日志/.test(appJs.slice(appJs.indexOf('if (isTeleagent)'), appJs.indexOf('if (isEcloud)'))), 'TeleAgent 卡片必须移除「看本平台日志」按钮');
+  assert.ok(/card-action-tools-2x2/.test(appJs), 'TeleAgent 剩余 4 个按钮应使用 2x2 宽网格避免文字遮挡');
+  assert.strictEqual(typeof taProto.createQrLoginSession, 'function', 'teleagent_protocol 必须导出 createQrLoginSession');
+  assert.strictEqual(typeof taProto.pollQrLoginSession, 'function', 'teleagent_protocol 必须导出 pollQrLoginSession');
+  assert.ok(/pathname === '\/api\/accounts\/teleagent\/qrcode\/generate'/.test(server), '缺少 TeleAgent 扫码二维码生成接口');
+  assert.ok(/pathname === '\/api\/accounts\/teleagent\/qrcode\/status'/.test(server), '缺少 TeleAgent 扫码状态轮询接口');
+  assert.ok(/id="btn-ta-get-qr"/.test(indexHtml), 'TeleAgent 扫码页签必须提供手动获取二维码按钮');
+  assert.ok(/id="btn-ctyun-get-qr"/.test(indexHtml), '天翼云扫码页签必须提供手动获取二维码按钮');
+
+  // 防自动触发校验：switchAccountLoginTab 内不得自动调 loadQrCodeForModal 或 refreshModalCaptcha
+  const swMatch = appJs.match(/function switchAccountLoginTab\(tab\) \{[\s\S]*?\n\}/);
+  assert.ok(swMatch, '未找到 switchAccountLoginTab');
+  assert.ok(!/loadQrCodeForModal\s*\(/.test(swMatch[0]), '切换天翼云扫码页签不得自动拉取二维码');
+  assert.ok(!/refreshModalCaptcha\s*\(/.test(swMatch[0]), '切换天翼云密码页签不得自动拉取图形验证码');
+});
+
+test('静态与行为：天翼云单机7档周期/独立Cron模态框、日志容量限制与默认通知模板', () => {
+  // 1) 天翼云单机 7 档保活间隔 + 独立 Cron 模态框
+  for (const sec of ['30', '60', '180', '300', '600', '900', '1800']) {
+    assert.ok(new RegExp(`value="${sec}"`).test(appJs), `天翼云单机周期缺少 ${sec}s 选项`);
+  }
+  assert.ok(/id="ctyun-desktop-cron-modal"/.test(indexHtml), '缺少独立的天翼云单机自定义 Cron 模态框');
+  assert.ok(/openCtyunDesktopCronModal\(/.test(appJs), '天翼云卡片单机行必须提供独立定时规则按钮');
+  assert.ok(/featureName === 'customCron'/.test(serverCode), '后端 vm-feature 必须支持 customCron');
+  assert.ok(/runDesktopCustomCrons\(/.test(schedulerCode), 'scheduler.js 必须执行天翼云单机自定义 Cron 规则');
+
+  // 2) 日志容量限制 + 前后端彻底清屏 + 分类优化
+  const os = require('os');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ctyun-log-limit-'));
+  try {
+    const { LogPersister } = require(path.join(ROOT, 'app', 'persist_log.js'));
+    const p = new LogPersister({ dir: tmpDir, retentionDays: 7, maxFileBytes: 64 * 1024, maxTotalBytes: 256 * 1024 });
+    assert.strictEqual(p.init(), true);
+    for (let i = 0; i < 800; i++) {
+      p.append({ timestamp: '2026-11-25 12:00:00', source: 'System', message: 'X'.repeat(160) + i, level: 'info' });
+    }
+    p.enforceSizeLimits();
+    const sizeAfter = fs.statSync(p.currentFile()).size;
+    assert.ok(sizeAfter <= 64 * 1024, `单日日志超过上限后必须截断控制体积，实际 ${sizeAfter} bytes`);
+    const removed = p.clearAll();
+    assert.ok(removed >= 1, 'clearAll 必须清理落盘日志文件');
+    assert.strictEqual(fs.existsSync(p.currentFile()), false, 'clearAll 后磁盘日志文件应被清除');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+  assert.ok(/id="tab-alert"/.test(indexHtml) && /id="tab-platform-system"/.test(indexHtml), '日志区应包含系统与异常告警分类按钮');
+
+  // 3) 默认通知模板严格对齐（前后端同源）
+  assert.ok(/DEFAULT_NOTIFY_TITLE_TEMPLATE = '\{account\} - \{title\}'/.test(serverCode), '后端默认通知标题模板必须为 {account} - {title}');
+  assert.ok(/DEFAULT_NOTIFY_CONTENT_TEMPLATE = '\{time\}\\n\\n\{account\}\\n\\n\{task\} - \{status\}\\n\\n\{content\}'/.test(serverCode), '后端默认通知内容模板必须与约定一致');
+  assert.ok(/DEFAULT_NOTIFY_TITLE_TEMPLATE = "\{account\} - \{title\}"/.test(appJs), '前端默认通知标题模板必须为 {account} - {title}');
+  assert.ok(/DEFAULT_NOTIFY_CONTENT_TEMPLATE = "\{time\}\\n\\n\{account\}\\n\\n\{task\} - \{status\}\\n\\n\{content\}"/.test(appJs), '前端默认通知内容模板必须与约定一致');
+
+  // 4) 天翼云平台隔离：移除未接入接口的「抽奖 / lottery」串台占位项
+  assert.ok(!/value="lottery"|幸运抽奖/.test(indexHtml), '天翼云兑换界面不得残留未接入的幸运抽奖占位选项');
+  assert.ok(!/type === "lottery"|自动兑换\/抽奖/.test(appJs), '天翼云前端逻辑不得残留 lottery 串台分支');
+});
+
+test('行为与静态：天翼云状态归一化、自动开机守护(方案A)与单机Cron请求方法修复', () => {
+  const vm = require('vm');
+  // 从 server.js 提取 CtYunClient.normalizePowerState 做真实行为测试
+  const fnMatch = serverCode.match(/static normalizePowerState\(desktop = \{\}\) \{[\s\S]*?\n  \}/);
+  assert.ok(fnMatch, 'server.js 必须定义 CtYunClient.normalizePowerState');
+  const normalize = vm.runInNewContext(`(function(){ class T { ${fnMatch[0]} } return T.normalizePowerState; })()`);
+
+  assert.strictEqual(normalize({ useStatus: 25, useStatusText: '运行中' }).powerState, 'on');
+  assert.strictEqual(normalize({ useStatus: 25 }).powerState, 'on');
+  assert.strictEqual(normalize({ useStatusText: '休眠中' }).powerState, 'sleeping');
+  assert.strictEqual(normalize({ useStatusText: '开机中' }).powerState, 'starting');
+  assert.strictEqual(normalize({ useStatusText: '已关机' }).powerState, 'off');
+  assert.strictEqual(normalize({ useStatus: 0 }).powerState, 'off', 'useStatus=0 不得误判为运行中');
+  assert.strictEqual(normalize({}).powerState, 'unknown', '缺失状态字段不得假兜底为运行中');
+  assert.strictEqual(normalize({}).statusText, '状态未知');
+
+  // 验证天翼云守护 + 方案 A 双通知 + 10 分钟冷却 + 防误报观察器(连续3次+3分钟+status交叉核验)与前端控件
+  assert.ok(/CTYUN_AUTOBOOT_COOLDOWN_MS\s*=\s*10\s*\*\s*60\s*\*\s*1000/.test(serverCode), '天翼云自动开机守护必须有 10 分钟冷却');
+  assert.ok(/CTYUN_OFFLINE_CONFIRM_MS\s*=\s*3\s*\*\s*60\s*\*\s*1000/.test(serverCode), '天翼云防误报观察窗必须至少为 3 分钟');
+  assert.ok(/CTYUN_OFFLINE_CONFIRM_COUNT\s*=\s*3/.test(serverCode), '天翼云防误报必须要求至少连续 3 次采样确认');
+  assert.ok(/_isAutoBootArmed\(desktop\)/.test(serverCode) && /async _healDesktop\(desktop\)/.test(serverCode), 'CtYunClient 必须具备 _isAutoBootArmed 与 _healDesktop');
+  assert.ok(/async probeDesktopOnlineViaStatus\(desktopId\)/.test(serverCode) && /false_positive_intercepted/.test(serverCode) && /probe_unverified/.test(serverCode), '触发守护前必须经独立只读 status 交叉核验并拦截假离线误报');
+  assert.ok(/云电脑检测到休眠，正在自动唤醒/.test(serverCode), '方案 A：休眠唤醒触发必须发送通知');
+  assert.ok(/云电脑已离线\/关机，正在自动拉起/.test(serverCode), '方案 A：关机拉起触发必须发送通知');
+  assert.ok(/云电脑已自愈恢复运行/.test(serverCode), '方案 A：自愈恢复运行必须发送通知');
+  assert.ok(/getCtyunPowerBadgeInfo\(d\)/.test(appJs), '天翼云前端必须使用统一的四态徽章解析函数');
+  assert.ok(/id="acc-heal-count-\$\{acc\.id\}"/.test(appJs), '天翼云卡片监控区必须展示自愈次数');
+  assert.ok(/method:\s*"PUT"[\s\S]{0,120}feature:\s*"customCron"/.test(appJs), 'saveCtyunDesktopCron 必须使用 PUT 提交 vm-feature');
+
+  // 真实行为验证：_updateNonRunningObservation 防抖状态机
+  const obsMatch = serverCode.match(/_updateNonRunningObservation\(desktop, now = Date\.now\(\), prevConfirmedState = 'unknown'\) \{[\s\S]*?\n  \}/);
+  assert.ok(obsMatch, 'server.js 必须定义 _updateNonRunningObservation');
+  const makeObs = vm.runInNewContext(`(function(){
+    const CTYUN_OFFLINE_CONFIRM_MS = 3 * 60 * 1000;
+    const CTYUN_OFFLINE_CONFIRM_COUNT = 3;
+    const CTYUN_OFFLINE_SAMPLE_MIN_GAP_MS = 25 * 1000;
+    class CtYunClient { ${fnMatch[0]} ${obsMatch[0]} }
+    return function() { const c = new CtYunClient(); c._nonRunningTracker = new Map(); return c; };
+  })()`);
+  const obsClient = makeObs();
+  const t0 = 1700000000000;
+  const r1 = obsClient._updateNonRunningObservation({ desktopId: 'd1', useStatus: 0, useStatusText: '已关机', rawPowerState: 'off', rawStatusText: '已关机' }, t0, 'on');
+  assert.strictEqual(r1.state, 'observing', '第 1 次非运行采样必须只进入观察期，不得立刻触发关机');
+  assert.strictEqual(r1.justStarted, true);
+  // 5 秒后连刷不得计入有效次数
+  const r1b = obsClient._updateNonRunningObservation({ desktopId: 'd1', useStatus: 0, useStatusText: '已关机', rawPowerState: 'off', rawStatusText: '已关机' }, t0 + 5000, 'on');
+  assert.strictEqual(r1b.count, 1, '小于 25s 间隔的采样不得累计确认次数');
+  // 观察期内恢复 on 必须归位并清零
+  const rRec = obsClient._updateNonRunningObservation({ desktopId: 'd1', useStatus: '25', useStatusText: '运行中', rawPowerState: 'on', rawStatusText: '运行中' }, t0 + 40000, 'on');
+  assert.strictEqual(rRec.state, 'recovered', '瞬态波动恢复后必须判为 recovered 并取消误报');
+  assert.strictEqual(obsClient._nonRunningTracker.size, 0);
+  // 连续 3 次且持续满 3 分钟才允许进入交叉核验
+  const t1 = t0 + 100000;
+  assert.strictEqual(obsClient._updateNonRunningObservation({ desktopId: 'd1', rawPowerState: 'sleeping', rawStatusText: '休眠中' }, t1, 'on').state, 'observing');
+  assert.strictEqual(obsClient._updateNonRunningObservation({ desktopId: 'd1', rawPowerState: 'sleeping', rawStatusText: '休眠中' }, t1 + 90000, 'on').state, 'observing');
+  const rReady = obsClient._updateNonRunningObservation({ desktopId: 'd1', rawPowerState: 'sleeping', rawStatusText: '休眠中' }, t1 + 190000, 'on');
+  assert.strictEqual(rReady.state, 'ready_to_verify', '连续 3 次且持续 >= 3 分钟后必须进入 ready_to_verify 交叉核验阶段');
+});
+
+test('行为与静态：TeleAgent 积分任务独立触发器与前端电源管理/打开按钮布局改造', () => {
+  // 1) TeleAgent 积分任务独立 Cron 触发器（前后端 + 调度器）
+  assert.ok(/id="teleagent-sign-cron-modal"/.test(indexHtml), 'index.html 必须包含 TeleAgent 积分任务独立触发器模态框');
+  assert.ok(/openTeleagentSignCronModal\('\$\{acc\.id\}'\)/.test(appJs), 'TeleAgent 卡片积分栏必须提供独立定时规则入口');
+  assert.ok(/body\.customCron !== undefined && acc\.platform === 'teleagent'/.test(serverCode), 'PUT /api/accounts/:id 必须支持保存 TeleAgent 账号级 customCron');
+  assert.ok(/isTeleagentSignGovernedByAccountCron\(acc\)/.test(schedulerCode), 'scheduler.js 必须判定 TeleAgent 独立积分 Cron 管辖');
+  assert.ok(/runTeleagentCustomCrons\(bj, currentMinKey\)/.test(schedulerCode), 'scheduler.js 必须执行 TeleAgent 独立积分 Cron');
+
+  // 2) TeleAgent 前端布局改造：名下主机加“打开”、移除行内开机/重启、底部移除“打开云电脑”并在“同步实例”后加“电源管理”
+  const taStart = appJs.indexOf('if (isTeleagent) {');
+  const taEnd = appJs.indexOf('if (isEcloud) {');
+  assert.ok(taStart > 0 && taEnd > taStart, '未能定位 TeleAgent 卡片渲染代码块');
+  const taSeg = appJs.slice(taStart, taEnd);
+
+  assert.ok(/\$\{powerBadge\}[\s\S]{0,260}openTeleagentDesktop\('\$\{acc\.id\}', '\$\{escapeHtml\(iid\)\}'\)[\s\S]{0,120}🚀 打开<\/button>/.test(taSeg), 'TeleAgent 名下云主机运行状态徽章后必须紧跟「🚀 打开」按钮');
+  assert.ok(!/powerTeleagentDesktop\(/.test(taSeg), 'TeleAgent 名下云主机行内不得保留开机/重启按钮（应迁入电源管理防误触）');
+  assert.ok(!/🚀 打开云电脑<\/button>/.test(taSeg), 'TeleAgent 卡片最下方必须移除「🚀 打开云电脑」按钮');
+  assert.ok(/syncTeleagentInstances\('\$\{acc\.id\}'\)[\s\S]{0,200}openPowerModal\('\$\{acc\.id\}'\)[\s\S]{0,100}⚡ 电源管理<\/button>/.test(taSeg), 'TeleAgent 底部「🔄 同步实例」后必须紧跟「⚡ 电源管理」按钮');
+  assert.ok(/if \(acc\.platform === 'teleagent'\)[\s\S]{0,400}btnShutdown\.classList\.add\("hidden"\)/.test(appJs), '统一电源管理弹窗必须适配 TeleAgent 平台');
+});
+
+test('行为与静态：Discord Webhook 通知兼容与脉冲旁观 1005 正常回收日志降噪', () => {
+  // 1) Discord Webhook 前后端接入与安全校验
+  assert.ok(/<option value="discord">/.test(indexHtml), '前端通知渠道下拉框必须包含 Discord Webhook 选项');
+  assert.ok(/channel === "discord"[\s\S]{0,150}discord\.com\/api\/webhooks/.test(appJs), '前端通知渠道切换逻辑必须适配 Discord Webhook');
+  assert.ok(/channel === 'discord' && notify\.webhookUrl/.test(serverCode), '后端 sendNotification 必须支持 discord 推送分支');
+  assert.ok(/allowed_mentions:\s*\{\s*parse:\s*\[\]\s*\}/.test(serverCode), 'Discord 推送必须禁用意外 @everyone 提及');
+  assert.ok(/\.slice\(0, 256\)/.test(serverCode) && /\.slice\(0, 4096\)/.test(serverCode), 'Discord Embed 标题/正文必须满足官方 256/4096 长度限制');
+
+  // 2) 脉冲旁观完成 REDQ + 103/118 握手后的 1005 网关正常回收降噪，不得破坏挂机模式 Unverified Channel Close
+  assert.ok(/!isHangMode && !goalTaskName && handshakeDone && redqCount > 0 && !clientPresenceSignal && code === 1005/.test(serverCode), '脉冲旁观握手完成后收到 1005 应识别为网关正常回收');
+  assert.ok(/Pulse Completed \(Gateway Recycle\)/.test(serverCode), '脉冲旁观正常回收应结束本轮会话而不刷 warning 告警');
+});
+
+test('静态：浏览器图标、Compose 网络/回环绑定、多架构 CI、版本号与独立更新日志', () => {
+  assert.ok(fs.existsSync(path.join(ROOT, 'app', 'static', 'favicon.png')), 'app/static/favicon.png 必须存在');
+  assert.ok(/href="\/static\/favicon\.png"/.test(indexHtml), 'index.html 必须配置 favicon.png');
+  assert.ok(/pathname === '\/favicon\.png'/.test(serverCode), 'server.js 必须响应 /favicon.png 与 /favicon.ico');
+
+  const compose = read('docker-compose.yml');
+  assert.ok(/network_mode:\s*"bridge"/.test(compose), 'docker-compose.yml 必须配置 network_mode: "bridge"');
+  assert.ok(/127\.0\.0\.1:8571:8571/.test(compose), 'docker-compose.yml 默认端口必须监听在 127.0.0.1');
+
+  const wf = read('.github/workflows/docker-build.yml');
+  assert.ok(/platforms:\s*linux\/amd64,linux\/arm64/.test(wf), 'CI 必须支持 linux/amd64,linux/arm64 多架构构建');
+
+  const pkg = JSON.parse(read('package.json'));
+  assert.strictEqual(pkg.version, '2.4.0', 'package.json 版本号必须已更新至 2.4.0');
+  assert.ok(/v2\.4\.0/.test(indexHtml), 'index.html 页面版本号必须同步更新至 v2.4.0');
+  assert.ok(fs.existsSync(path.join(ROOT, 'CHANGELOG.md')), '项目根目录必须存在独立的 CHANGELOG.md');
+  assert.ok(/muyicn\/ctyun-dashboard/.test(read('README.md')), 'README.md 必须注明源自 muyicn/ctyun-dashboard');
 });
 
 // ============================================================================

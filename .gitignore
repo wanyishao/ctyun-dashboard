@@ -1,13 +1,14 @@
 # 依赖目录
 node_modules/
+.venv
+.venv/
+venv/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
 # 生产运行时用户数据 (容器挂载目录，不纳入版本控制以保护密码隐私)
-data/*
-!data/devices/
-!data/devices/.gitkeep
+data/
 
 # 临时文件与日志
 *.log
@@ -16,6 +17,8 @@ data/*
 *.tmp
 .DS_Store
 Thumbs.db
+@eaDir/
+**/@eaDir/
 .last_firm_auth.json
 
 # 本地旧版前端备份 (不入库)
@@ -43,3 +46,25 @@ status_out.txt
 
 # 探针脚本的原始产物（平台返回原文 / 派生材料，绝不入库）
 tools/_*
+
+# 本机开发资料与补充规范（不纳入版本控制）
+/.local-dev/
+/local/
+AGENTS.md
+AGENTS.override.md
+
+# 环境变量与密钥证书文件
+.env
+.env.*
+!.env.example
+!.env.sample
+*.pem
+*.key
+*.p12
+*.pfx
+
+# 覆盖率与临时构建产物
+.coverage
+htmlcov/
+dist/
+build/
