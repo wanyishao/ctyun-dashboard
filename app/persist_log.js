@@ -35,6 +35,10 @@ const FILE_PREFIX = 'dashboard-';
 const FILE_SUFFIX = '.jsonl';
 const DEFAULT_RETENTION_DAYS = 7;
 const DEFAULT_BOOT_LINES = 400;
+/** 单日日志文件体积上限（默认 5MB），超限时自动截断保留最新一半，防止高频保活或异常刷屏撑爆磁盘 */
+const DEFAULT_MAX_FILE_BYTES = 5 * 1024 * 1024;
+/** 日志目录总体积上限（默认 20MB），超限时按日期从最旧文件开始清理 */
+const DEFAULT_MAX_TOTAL_BYTES = 20 * 1024 * 1024;
 /** 回灌时单个文件最多从尾部读取的字节数，防止超大文件拖慢启动 */
 const TAIL_READ_MAX_BYTES = 2 * 1024 * 1024;
 
@@ -47,19 +51,22 @@ class LogPersister {
   constructor(opts = {}) {
     this.dir = opts.dir || path.join(process.cwd(), 'logs');
     this.retentionDays = Math.max(1, parseInt(opts.retentionDays, 10) || DEFAULT_RETENTION_DAYS);
+    this.maxFileBytes = Math.max(64 * 1024, parseInt(opts.maxFileBytes, 10) || DEFAULT_MAX_FILE_BYTES);
+    this.maxTotalBytes = Math.max(256 * 1024, parseInt(opts.maxTotalBytes, 10) || DEFAULT_MAX_TOTAL_BYTES);
     this.onError = typeof opts.onError === 'function' ? opts.onError : () => {};
     this.enabled = false;
     this.currentDate = null;
     this.written = 0;
   }
 
-  /** 初始化：建目录、确定当日文件、清理超期文件。失败则降级为仅内存。 */
+  /** 初始化：建目录、确定当日文件、清理超期与超容文件。失败则降级为仅内存。 */
   init() {
     try {
       if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
       this.enabled = true;
       this.currentDate = beijingDateString();
       this.prune();
+      this.enforceSizeLimits(this.currentDate);
     } catch (e) {
       this.enabled = false;
       this.onError(`日志落盘初始化失败（已降级为仅内存日志）: ${e.message}`);
@@ -72,7 +79,7 @@ class LogPersister {
     return path.join(this.dir, `${FILE_PREFIX}${dateStr}${FILE_SUFFIX}`);
   }
 
-  /** 追加一条原始日志条目。跨天自动滚动文件并触发清理。 */
+  /** 追加一条原始日志条目。跨天自动滚动文件并触发清理；周期性检查磁盘体积上限。 */
   append(entry) {
     if (!this.enabled || !entry) return false;
     try {
@@ -81,14 +88,85 @@ class LogPersister {
         this.currentDate = dateStr;
         this.prune();
       }
-      fs.appendFileSync(this.currentFile(dateStr), JSON.stringify(entry) + '\n', 'utf8');
+      const targetFile = this.currentFile(dateStr);
+      fs.appendFileSync(targetFile, JSON.stringify(entry) + '\n', 'utf8');
       this.written++;
+      // 每写入 64 条执行一次体积巡检，兼顾性能与磁盘防爆
+      if (this.written % 64 === 0) {
+        this.enforceSizeLimits(dateStr);
+      }
       return true;
     } catch (e) {
       this.enabled = false;
       this.onError(`日志落盘失败（已降级为仅内存日志）: ${e.message}`);
       return false;
     }
+  }
+
+  /** 强制控制单日文件体积与日志目录总体积，防止产生巨量日志 */
+  enforceSizeLimits(activeDateStr = beijingDateString()) {
+    if (!this.enabled) return;
+    try {
+      const activeFile = this.currentFile(activeDateStr);
+      if (fs.existsSync(activeFile)) {
+        const st = fs.statSync(activeFile);
+        if (st.size > this.maxFileBytes) {
+          const keepBytes = Math.floor(this.maxFileBytes / 2);
+          let fd = null;
+          try {
+            fd = fs.openSync(activeFile, 'r');
+            const start = Math.max(0, st.size - keepBytes);
+            const buf = Buffer.alloc(st.size - start);
+            fs.readSync(fd, buf, 0, buf.length, start);
+            let text = buf.toString('utf8');
+            if (start > 0) {
+              const nl = text.indexOf('\n');
+              text = nl >= 0 ? text.slice(nl + 1) : '';
+            }
+            fs.writeFileSync(activeFile, text, 'utf8');
+          } finally {
+            if (fd !== null) { try { fs.closeSync(fd); } catch (e) { /* 已关闭 */ } }
+          }
+        }
+      }
+
+      // 总目录体积保护：按日期从最旧文件开始淘汰
+      const filesNewestFirst = this._listFilesNewestFirst();
+      let totalBytes = 0;
+      const sized = [];
+      for (const f of filesNewestFirst) {
+        try {
+          const size = fs.statSync(f).size;
+          totalBytes += size;
+          sized.push({ file: f, size });
+        } catch (e) { /* 忽略并发删除 */ }
+      }
+      for (let i = sized.length - 1; i >= 1 && totalBytes > this.maxTotalBytes; i--) {
+        try {
+          fs.unlinkSync(sized[i].file);
+          totalBytes -= sized[i].size;
+        } catch (e) { /* 忽略占用 */ }
+      }
+    } catch (e) {
+      this.onError(`日志容量控制异常: ${e.message}`);
+    }
+  }
+
+  /** 清空全部已落盘的 dashboard-*.jsonl 日志文件（供管理员手动清屏联动后端清空） */
+  clearAll() {
+    if (!this.enabled) return 0;
+    let removed = 0;
+    try {
+      for (const file of this._listFilesNewestFirst()) {
+        try {
+          fs.unlinkSync(file);
+          removed++;
+        } catch (e) { /* 忽略占用/权限 */ }
+      }
+    } catch (e) {
+      this.onError(`清空落盘日志失败: ${e.message}`);
+    }
+    return removed;
   }
 
   /** 清理超过保留天数的历史文件（按文件名中的日期判断） */

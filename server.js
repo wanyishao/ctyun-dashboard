@@ -20,7 +20,13 @@ const { SohoClient } = require('./app/ydpc/soho_client');
 const { performCagAuthHold } = require('./app/ydpc/cag_client');
 const { YdpcClient } = require('./app/ydpc/ydpc_client');
 const { EcloudClient, LOG_SOURCE: ECLOUD_LOG_SOURCE, INTERACTIVE_BRANCHES } = require('./app/ecloud/ecloud_client');
+const { TeleagentClient, LOG_SOURCE: TELEAGENT_LOG_SOURCE, buildTeleagentDefaultFeatures } = require('./app/teleagent/teleagent_client');
+const teleagentProto = require('./app/teleagent/teleagent_protocol');
 const { LogPersister } = require('./app/persist_log');
+
+// 默认消息通知模板（前后端统一，避免留空导致各通道排版不统一）
+const DEFAULT_NOTIFY_TITLE_TEMPLATE = '{account} - {title}';
+const DEFAULT_NOTIFY_CONTENT_TEMPLATE = '{time}\n\n{account}\n\n{task} - {status}\n\n{content}';
 
 // 全局异常拦截看门狗 (确保守护服务长期稳定运行不宕机)
 // 【2026-09-27 退出取证】现场：面板曾静默死亡一次（exit=1、stdout/stderr 零输出、
@@ -39,21 +45,27 @@ process.on('unhandledRejection', (reason) => {
   try { appendLog('System', `⚠️ 未处理 Promise 拒绝已拦截: ${(reason && reason.message) || reason}`, 'error'); } catch (e) { /* 同上 */ }
 });
 process.on('exit', (code) => {
+  try { releaseInstanceLock(); } catch (e) { /* 退出路径尽力而为 */ }
   try {
     appendLog('System', `⚠️ 主进程即将退出 (code=${code})${code === 0 ? '' : ' —— 非零退出码，请对照上一条异常/信号日志'}`, code === 0 ? 'warning' : 'error');
   } catch (e) { /* 退出路径尽力而为 */ }
 });
 process.on('SIGINT', () => {
   try { appendLog('System', '收到 SIGINT (Ctrl+C)，主进程即将退出', 'warning'); } catch (e) { /* 同上 */ }
+  try { releaseInstanceLock(); } catch (e) { /* 同上 */ }
   process.exit(0);
 });
 process.on('SIGTERM', () => {
   try { appendLog('System', '收到 SIGTERM，主进程即将退出', 'warning'); } catch (e) { /* 同上 */ }
+  try { releaseInstanceLock(); } catch (e) { /* 同上 */ }
   process.exit(0);
 });
 
+const HOST = process.env.HOST || '0.0.0.0';
 const PORT = process.env.PORT || 8571;
+const INSTANCE_NAME = (process.env.CTYUN_INSTANCE_NAME || '').trim();
 const DATA_DIR = process.env.CTYUN_DATA_DIR || path.join(__dirname, 'data');
+const INSTANCE_LOCK_FILE = path.join(DATA_DIR, '.instance.lock');
 const STATIC_DIR = path.join(__dirname, 'app', 'static');
 const CONFIG_FILE = path.join(DATA_DIR, 'app_config.json');
 const ACCOUNTS_JSON = path.join(DATA_DIR, 'accounts.json');
@@ -62,14 +74,76 @@ const DEVICES_DIR = path.join(DATA_DIR, 'devices');
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(DEVICES_DIR)) fs.mkdirSync(DEVICES_DIR, { recursive: true });
 
+let _instanceLockOwned = false;
+
+function isProcessAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e && e.code === 'EPERM';
+  }
+}
+
+/**
+ * DATA_DIR 独占实例锁：多实例并行运行时，确保不同任务使用各自独立的数据目录与端口，
+ * 防止两个进程误写同一份 app_config.json / auth_sessions.json 引发配置覆盖与会话冲突。
+ */
+function acquireInstanceLock() {
+  if (fs.existsSync(INSTANCE_LOCK_FILE)) {
+    try {
+      const existing = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf8'));
+      const oldPid = parseInt(existing && existing.pid, 10);
+      if (oldPid && oldPid !== process.pid && isProcessAlive(oldPid)) {
+        const err = new Error(
+          `数据目录 ${DATA_DIR} 已被另一个活跃实例占用 (pid=${oldPid}, port=${existing.port || '?'}${existing.instanceName ? `, name=${existing.instanceName}` : ''})。` +
+          '并行运行多个面板/任务时，请为每个实例指定独立的 CTYUN_DATA_DIR 与 PORT。'
+        );
+        err.code = 'CTYUN_DATA_DIR_LOCKED';
+        throw err;
+      }
+    } catch (e) {
+      if (e && e.code === 'CTYUN_DATA_DIR_LOCKED') throw e;
+      // 损坏或残留的死锁文件直接接管覆盖
+    }
+  }
+  const payload = {
+    pid: process.pid,
+    host: HOST,
+    port: String(PORT),
+    instanceName: INSTANCE_NAME || `ctyun-${PORT}`,
+    startedAt: new Date().toISOString()
+  };
+  fs.writeFileSync(INSTANCE_LOCK_FILE, JSON.stringify(payload, null, 2), 'utf8');
+  _instanceLockOwned = true;
+}
+
+function releaseInstanceLock() {
+  if (!_instanceLockOwned) return;
+  _instanceLockOwned = false;
+  try {
+    if (!fs.existsSync(INSTANCE_LOCK_FILE)) return;
+    const cur = JSON.parse(fs.readFileSync(INSTANCE_LOCK_FILE, 'utf8'));
+    if (cur && parseInt(cur.pid, 10) === process.pid) {
+      fs.unlinkSync(INSTANCE_LOCK_FILE);
+    }
+  } catch (e) { /* 退出清理尽力而为 */ }
+}
+
 // 运行日志落盘（按北京日期滚动，默认保留 7 天）。
 // 为什么：日志原本只在内存 `logs` 数组里，服务重启即丢 —— 事后无法复盘
 // "机器为何被关机、当时保活在不在跑"。落盘失败会自动降级为仅内存，绝不影响主流程。
 const LOG_DIR = path.join(DATA_DIR, 'logs');
 const BOOT_LOG_LINES = Math.max(0, parseInt(process.env.CTYUN_LOG_BOOT_LINES, 10) || 400);
+const LOG_MAX_MEMORY_LINES = Math.max(200, parseInt(process.env.CTYUN_LOG_MAX_MEMORY_LINES, 10) || 1500);
+const LOG_MAX_FILE_BYTES = Math.max(1, parseInt(process.env.CTYUN_LOG_MAX_FILE_MB, 10) || 5) * 1024 * 1024;
+const LOG_MAX_TOTAL_BYTES = Math.max(2, parseInt(process.env.CTYUN_LOG_MAX_TOTAL_MB, 10) || 20) * 1024 * 1024;
 const logPersister = new LogPersister({
   dir: LOG_DIR,
   retentionDays: parseInt(process.env.CTYUN_LOG_RETENTION_DAYS, 10) || 7,
+  maxFileBytes: LOG_MAX_FILE_BYTES,
+  maxTotalBytes: LOG_MAX_TOTAL_BYTES,
   onError: (msg) => console.error(`[日志落盘] ${msg}`)
 });
 logPersister.init();
@@ -129,6 +203,7 @@ const ROUTINE_MESSAGE_PATTERNS = [
   '桌面登记成功',          // 移动公众 L2 桌面登记
   '分层巡检结果',          // 移动公众 L1/L2 汇总汇报
   '已同步桌面列表',        // 移动公众桌面同步
+  '保活换票与活跃信号完成', // 天翼星辰 TeleAgent 周期心跳与换票
   '心跳', '保活周期', '保持长连接', '长连接保活', '发送保活',
   'REDQ', '103 认证', '118 用户身份', '118 身份',
 ];
@@ -230,11 +305,12 @@ function scheduleRoutineFoldDayRollover() {
 }
 scheduleRoutineFoldDayRollover();
 
-// 自动日志清理维护定时器：每小时执行一次，自动清理超过 3 天的历史日志或多于 2000 条的数据
+// 自动日志清理维护定时器：每小时执行一次，保持内存日志在上限内并巡检磁盘日志体积
 setInterval(() => {
-  if (logs.length > 1500) {
-    logs.splice(0, logs.length - 1000);
+  if (logs.length > LOG_MAX_MEMORY_LINES) {
+    logs.splice(0, logs.length - Math.floor(LOG_MAX_MEMORY_LINES * 0.7));
   }
+  logPersister.enforceSizeLimits();
 }, 3600 * 1000);
 
 /** 智能推断平台归属 */
@@ -242,6 +318,8 @@ function inferLogPlatform(source, platform) {
   if (source === 'SOHO' || source === 'CAG' || source === 'CSAP' || source === 'YDPc') return 'ydpc';
   // 移动公众（ecloud）走独立侧车，日志源固定为 ECLOUD —— 与移动爱家/天翼云的日志流严格分开
   if (source === ECLOUD_LOG_SOURCE || source === 'ECLOUD') return 'ecloud';
+  // 天翼星辰（teleagent）走独立协议客户端，日志源固定为 TELEAGENT —— 四平台日志各自成流
+  if (source === 'TELEAGENT') return 'teleagent';
   if (source === 'Sign' || source === 'AIChat' || source === 'Hang' || source === 'Redeem') return 'ctyun';
   return platform || 'ctyun';
 }
@@ -364,7 +442,8 @@ function ingestLogEntry(entry) {
   logs.push(entry);
   // 例行日志登记进折叠索引：下一轮同类消息将直接命中它，不再依赖"向前扫 N 条"
   if (foldIndexKey) routineFoldIndex.set(foldIndexKey, entry);
-  if (logs.length > 2000) logs.shift();
+  const maxMemLines = typeof LOG_MAX_MEMORY_LINES === 'number' ? LOG_MAX_MEMORY_LINES : 1500;
+  if (logs.length > maxMemLines) logs.shift();
 
   // 推送给具备权限的 SSE 客户端
   for (const client of sseClients) {
@@ -529,7 +608,7 @@ function isValidWebhookTarget(channel, rawTarget) {
     return true;
   }
 
-  // URL 型推送渠道 (webhook, qywx, dingtalk, feishu, bark)
+  // URL 型推送渠道 (webhook, qywx, dingtalk, feishu, bark, discord)
   try {
     // 剥离可能附带的 @SEC... 密钥后缀以供 URL 校验
     const checkUrl = target.split('@SEC')[0].trim();
@@ -566,17 +645,36 @@ async function sendNotification(settings, title, content, extraVars = {}) {
     return { success: false, message: '安全拦截：禁止向内网/本地私有地址或非法格式发送推送' };
   }
   
-  // 模板变量替换
-  let finalTitle = notify.customTitleTemplate || title;
-  let finalContent = notify.customContentTemplate || content;
+  // 模板变量替换（未自定义或留空时使用统一默认通知模板）
+  let finalTitle = String(notify.customTitleTemplate || '').trim() || DEFAULT_NOTIFY_TITLE_TEMPLATE;
+  let finalContent = String(notify.customContentTemplate || '').trim() || DEFAULT_NOTIFY_CONTENT_TEMPLATE;
+
+  const inferTask = () => {
+    const text = `${title || ''} ${content || ''}`;
+    if (/签到|打卡/.test(text)) return '每日签到';
+    if (/AI\s*对话|智能对话/.test(text)) return 'AI 对话';
+    if (/挂机/.test(text)) return '云电脑挂机';
+    if (/兑换|积分商城/.test(text)) return '积分兑换';
+    if (/开机|拉起/.test(text)) return '自动开机守护';
+    if (/登录|失效|过期|会话/.test(text)) return '会话状态监测';
+    if (/保活|心跳/.test(text)) return '保活守护';
+    return '系统通知';
+  };
+  const inferStatus = () => {
+    const text = `${title || ''} ${content || ''}`;
+    if (/失败|异常|失效|过期|❌|中断/.test(text)) return '异常告警';
+    if (/⚠️|警告|关机|离线|熔断/.test(text)) return '状态提醒';
+    if (/成功|达成|完成|已恢复|已拉起|🎉|✅/.test(text)) return '成功';
+    return '已触发';
+  };
 
   const vars = {
     '{title}': title,
     '{content}': content,
     '{time}': getBeijingTimeString(),
     '{account}': extraVars.account || '云电脑',
-    '{task}': extraVars.task || '',
-    '{status}': extraVars.status || '',
+    '{task}': extraVars.task || inferTask(),
+    '{status}': extraVars.status || inferStatus(),
     '{points}': extraVars.points || ''
   };
 
@@ -750,6 +848,37 @@ async function sendNotification(settings, title, content, extraVars = {}) {
         });
         return { success: res.ok, message: `HTTP ${res.status}` };
       }
+    } else if (channel === 'discord' && notify.webhookUrl) {
+      // Discord Webhook 官方协议：支持 Embed 卡片、状态着色、长度保护与 HTTP 204/200 成功判定
+      const statusText = vars['{status}'] || '';
+      let embedColor = 0x3b82f6; // 默认蓝
+      if (statusText === '异常告警') embedColor = 0xef4444;
+      else if (statusText === '状态提醒') embedColor = 0xf59e0b;
+      else if (statusText === '成功') embedColor = 0x16a34a;
+
+      const discordPayload = {
+        username: '云电脑守护面板',
+        allowed_mentions: { parse: [] },
+        embeds: [
+          {
+            title: String(finalTitle || '云电脑通知').slice(0, 256),
+            description: String(finalContent || '').slice(0, 4096),
+            color: embedColor,
+            footer: { text: `云电脑守护面板 · ${vars['{time}']}` }
+          }
+        ]
+      };
+      const res = await fetchWithTimeout(notify.webhookUrl.trim(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(discordPayload)
+      }, 15000);
+      if (res.ok) {
+        return { success: true, message: `HTTP ${res.status}` };
+      }
+      const errData = await res.json().catch(() => ({}));
+      const errMsg = errData.message ? `${errData.message}${errData.code ? ` (code: ${errData.code})` : ''}` : `HTTP ${res.status}`;
+      return { success: false, message: errMsg };
     }
   } catch (err) {
     appendLog('Notify', `通知发送异常: ${err.message}`, 'error');
@@ -903,7 +1032,9 @@ function getDefaultConfig() {
       notify: {
         enabled: false,
         channel: 'webhook',
-        webhookUrl: ''
+        webhookUrl: '',
+        customTitleTemplate: DEFAULT_NOTIFY_TITLE_TEMPLATE,
+        customContentTemplate: DEFAULT_NOTIFY_CONTENT_TEMPLATE
       },
       systemTitle: '天翼云/移动云电脑保活签到中心',
       systemSubtitle: '多账号长连接保活守护 · 多运营商支持 · 每日签到打卡 · 智能挂机'
@@ -978,6 +1109,7 @@ function loadConfig() {
       if (!a.ownerId) a.ownerId = 'u_admin';
       if (!a.platform) a.platform = 'ctyun';
       if (a.password) a.password = decryptPassword(a.password);
+      if (a.savedJwt) a.savedJwt = decryptPassword(a.savedJwt);
     });
 
     // 如果是从备份恢复的，立即原子回写主配置文件修复现场
@@ -990,6 +1122,7 @@ function loadConfig() {
         if (Array.isArray(diskClone.accounts)) {
           for (const a of diskClone.accounts) {
             if (a.password) a.password = encryptPassword(a.password);
+            if (a.savedJwt) a.savedJwt = encryptPassword(a.savedJwt);
           }
         }
         atomicWriteFileSync(BAK_FILE, JSON.stringify(diskClone, null, 2), 'utf8');
@@ -1015,6 +1148,9 @@ function saveConfig(cfg) {
       for (const a of diskClone.accounts) {
         if (a.password) {
           a.password = encryptPassword(a.password);
+        }
+        if (a.savedJwt) {
+          a.savedJwt = encryptPassword(a.savedJwt);
         }
       }
     }
@@ -1148,6 +1284,14 @@ function resolveTaskEnabled(account, desktop, taskType) {
 // ==========================================================
 // 生产级天翼云原生客户端（纯协议实现保活心跳与会话链路）
 // ==========================================================
+const CTYUN_AUTOBOOT_COOLDOWN_MS = 10 * 60 * 1000;      // 同台云电脑 10 分钟自动拉起冷却
+const CTYUN_RESTART_GUARD_MS = 3 * 60 * 1000;           // 重启/启动保护窗 3 分钟
+const CTYUN_OFFLINE_CONFIRM_MS = 3 * 60 * 1000;         // 休眠/关机防误报观察窗：需持续至少 3 分钟（天翼云 1 小时无保活才休眠）
+const CTYUN_OFFLINE_CONFIRM_COUNT = 3;                  // 休眠/关机防误报最小连续采样次数：需连续至少 3 次确认
+const CTYUN_OFFLINE_SAMPLE_MIN_GAP_MS = 25 * 1000;      // 防抖采样最小有效间隔（25 秒），防止短时间内连刷凑满次数
+const CTYUN_DESKTOP_POLL_INTERVAL_MS = 60 * 1000;       // 常态列表轮询间隔（60 秒，减少高频接口毛刺）
+const CTYUN_OBSERVE_POLL_INTERVAL_MS = 45 * 1000;       // 处于异常观察期时的复检采样间隔（45 秒）
+
 class CtYunClient {
   constructor(account) {
     this.account = account;
@@ -1173,6 +1317,11 @@ class CtYunClient {
       lastHeartbeatResult: '未建立连接',
       successCount: initialTodayCount,
       errorCount: 0,
+      healCount: stats.healCount || 0,
+      sleepCount: stats.sleepCount || 0,
+      offlineCount: stats.offlineCount || 0,
+      lastHealAt: stats.lastHealAt || '',
+      lastHealReason: stats.lastHealReason || '',
       officialTasks: [],
       userPoints: 0
     };
@@ -1194,6 +1343,12 @@ class CtYunClient {
     this.signVerifyTimer = null;      // 打卡"待官方确认"复检定时器
     this.signVerifyPendingSince = null;
     this.signVerifyRound = 0;
+    this._autoBootCooldown = new Map(); // desktopId -> 上次触发自动拉起时间戳
+    this._restartingUntil = new Map();  // desktopId -> 重启/启动保护截止时间戳
+    this._desktopPowerCache = new Map(); // desktopId -> { powerState, statusText }
+    this._nonRunningTracker = new Map(); // desktopId -> { firstSeenAt, lastSampleAt, count, rawState, rawCode, rawText }
+    this._gatewayFailStreak = new Map(); // desktopId -> 连续视讯网关未分配次数
+    this._lastDesktopsFetchAt = 0;       // 上次主动拉取桌面列表时间戳
   }
 
   // 检测今日挂机 1 小时任务是否已达成 (严格依据今日真实达成状态)
@@ -1662,9 +1817,63 @@ class CtYunClient {
   }
 
   // 解析天翼云全形态云电脑列表 (普通独立单机、政企桌面池 POOL、抢占式桌面)
+  /**
+   * 天翼云电脑运行状态单一归一化口径（前后端统一，杜绝字段缺失时假兜底为「运行中」）。
+   * 返回 { powerState: 'on'|'sleeping'|'starting'|'off'|'unknown', statusText }
+   */
+  static normalizePowerState(desktop = {}) {
+    if (!desktop || typeof desktop !== 'object') {
+      return { powerState: 'unknown', statusText: '状态未知' };
+    }
+    const rawText = (desktop.useStatusText !== undefined && desktop.useStatusText !== null)
+      ? String(desktop.useStatusText).trim()
+      : '';
+    const code = desktop.useStatus;
+
+    // 1. 启动/唤醒/重启中
+    if (/启动|开机中|唤醒|重启|恢复中/.test(rawText)) {
+      return { powerState: 'starting', statusText: rawText || '启动中' };
+    }
+    // 2. 休眠/睡眠中
+    if (/休眠|睡眠|挂起/.test(rawText)) {
+      return { powerState: 'sleeping', statusText: rawText || '休眠中' };
+    }
+    // 3. 明确关机/停机/未启动
+    if (/关机|停机|停止|已关|未启动|离线/.test(rawText)) {
+      return { powerState: 'off', statusText: rawText || '已关机' };
+    }
+    // 4. 运行中（官方状态文本或状态码 25）
+    if (rawText.includes('运行') || code === 25 || String(code) === '25') {
+      return { powerState: 'on', statusText: rawText || '运行中' };
+    }
+    // 5. 数字码 0 且无运行文本时按关机处理
+    if (code === 0 || String(code) === '0') {
+      return { powerState: 'off', statusText: rawText || '已关机' };
+    }
+    // 6. 已有明确 powerState 字段时复用
+    const existing = String(desktop.powerState || '').toLowerCase();
+    if (['on', 'sleeping', 'starting', 'off'].includes(existing)) {
+      const textMap = { on: '运行中', sleeping: '休眠中', starting: '启动中', off: '已关机' };
+      return { powerState: existing, statusText: rawText || textMap[existing] };
+    }
+    return { powerState: 'unknown', statusText: rawText || '状态未知' };
+  }
+
   static parseAllDesktops(data = {}) {
     const list = [];
     const seen = new Set();
+
+    const buildStatusFields = (item) => {
+      const rawText = (item.useStatusText !== undefined && item.useStatusText !== null && String(item.useStatusText).trim() !== '')
+        ? String(item.useStatusText).trim()
+        : '';
+      const norm = CtYunClient.normalizePowerState({ useStatus: item.useStatus, useStatusText: rawText });
+      return {
+        useStatusText: norm.statusText,
+        useStatus: item.useStatus,
+        powerState: norm.powerState
+      };
+    };
 
     // 1. 普通单机 (公众版 / 个人独立机 / 尊享版等)
     if (Array.isArray(data.desktopList)) {
@@ -1673,13 +1882,15 @@ class CtYunClient {
         if (id && !seen.has(id)) {
           seen.add(id);
           const spec = CtYunClient.extractDesktopSpecs(item, '公众版');
+          const st = buildStatusFields(item);
           list.push({
             desktopId: id,
             objId: String(item.objId || id),
             desktopName: item.desktopName || item.objName || '天翼云电脑',
             desktopCode: item.desktopCode || '',
-            useStatusText: item.useStatusText || item.useStatus || '运行中',
-            useStatus: item.useStatus,
+            useStatusText: st.useStatusText,
+            useStatus: st.useStatus,
+            powerState: st.powerState,
             imageName: item.imageName || '',
             flavorName: spec.flavorName,
             cpu: spec.cpu,
@@ -1701,13 +1912,15 @@ class CtYunClient {
         if (id && !seen.has(id)) {
           seen.add(id);
           const spec = CtYunClient.extractDesktopSpecs(item, '政企版');
+          const st = buildStatusFields(item);
           list.push({
             desktopId: id,
             objId: poolId,
             desktopName: item.poolName || item.desktopName || '天翼云电脑(政企桌面池)',
             desktopCode: item.desktopCode || poolId,
-            useStatusText: item.useStatusText || item.useStatus || '运行中',
-            useStatus: item.useStatus,
+            useStatusText: st.useStatusText,
+            useStatus: st.useStatus,
+            powerState: st.powerState,
             imageName: item.imageName || '',
             flavorName: spec.flavorName,
             cpu: spec.cpu,
@@ -1728,13 +1941,15 @@ class CtYunClient {
         if (id && !seen.has(id)) {
           seen.add(id);
           const spec = CtYunClient.extractDesktopSpecs(item, '抢占式');
+          const st = buildStatusFields(item);
           list.push({
             desktopId: id,
             objId: id,
             desktopName: item.desktopName || '天翼云电脑(抢占式)',
             desktopCode: item.desktopCode || id,
-            useStatusText: item.useStatusText || item.useStatus || '运行中',
-            useStatus: item.useStatus,
+            useStatusText: st.useStatusText,
+            useStatus: st.useStatus,
+            powerState: st.powerState,
             imageName: item.imageName || '',
             flavorName: spec.flavorName,
             cpu: spec.cpu,
@@ -1972,23 +2187,70 @@ class CtYunClient {
       } catch (e) {}
 
       if (mergedList.length > 0) {
-        // 差量合并引擎 (Diff-Merge)：保留用户本地已设置的单机保活与任务偏好
+        // 差量合并引擎 (Diff-Merge)：保留用户本地已设置的单机保活、任务、自愈与防误报状态追踪
+        const accName = this.account.name || this.account.user;
         const oldMap = new Map((this.account.desktops || this.desktopsCache || []).map(d => [String(d.desktopId || d.objId), d]));
+        const nowTs = Date.now();
         for (const d of mergedList) {
           const dKey = String(d.desktopId || d.objId);
           const old = oldMap.get(dKey);
+          const norm = CtYunClient.normalizePowerState(d);
+          d.rawPowerState = norm.powerState;
+          d.rawStatusText = norm.statusText;
+          d.powerState = norm.powerState;
+          d.useStatusText = norm.statusText;
           if (old) {
             if (old.keepaliveEnabled !== undefined) d.keepaliveEnabled = old.keepaliveEnabled;
             if (old.taskEnabled !== undefined) d.taskEnabled = old.taskEnabled;
             if (old.autoBootEnabled !== undefined) d.autoBootEnabled = old.autoBootEnabled;
             if (old.keepaliveInterval !== undefined) d.keepaliveInterval = old.keepaliveInterval;
+            if (old.customCron !== undefined) d.customCron = old.customCron;
             if (old.lastPulseAt !== undefined) d.lastPulseAt = old.lastPulseAt;
+            if (old.manualShutdown !== undefined) d.manualShutdown = old.manualShutdown;
+            if (old.healCount !== undefined) d.healCount = old.healCount;
+            if (old.sleepCount !== undefined) d.sleepCount = old.sleepCount;
+            if (old.offlineCount !== undefined) d.offlineCount = old.offlineCount;
+            if (old.lastHealAt !== undefined) d.lastHealAt = old.lastHealAt;
+            if (old.lastHealReason !== undefined) d.lastHealReason = old.lastHealReason;
+            if (old.lastPowerState !== undefined) d.lastPowerState = old.lastPowerState;
+            if (old.lastPowerStateAt !== undefined) d.lastPowerStateAt = old.lastPowerStateAt;
           } else {
             if (d.keepaliveEnabled === undefined) d.keepaliveEnabled = true;
             if (d.taskEnabled === undefined) d.taskEnabled = true;
             if (d.autoBootEnabled === undefined) d.autoBootEnabled = true;
+            d.healCount = d.healCount || 0;
+            d.sleepCount = d.sleepCount || 0;
+            d.offlineCount = d.offlineCount || 0;
+          }
+
+          // 防误报状态机：单次瞬态非运行采样只进入观察期，不直接判定离线/关机，也不立刻刷告警
+          const dName = d.desktopName || dKey;
+          const prev = this._desktopPowerCache.get(dKey) || (d.lastPowerState ? { powerState: d.lastPowerState, statusText: d.lastPowerState } : null);
+          const obs = this._updateNonRunningObservation(d, nowTs, prev?.powerState || 'unknown');
+          if (obs.state === 'recovered') {
+            appendLog('KeepAlive', `[${accName}][${dName}] 状态瞬态波动已自动恢复为运行中（未触发误报告警）`, 'info');
+          } else if (obs.state === 'confirmed_on') {
+            if (prev && prev.powerState !== 'on' && prev.powerState !== 'unknown') {
+              appendLog('KeepAlive', `[${accName}][${dName}] 主机状态变化: ${prev.statusText || prev.powerState}(${prev.powerState}) → 运行中(on)`, 'success');
+              d.lastPowerStateAt = getBeijingTimeString();
+            }
+            d.lastPowerState = 'on';
+            this._desktopPowerCache.set(dKey, { powerState: 'on', statusText: d.useStatusText || '运行中' });
+          } else if (obs.state === 'observing') {
+            if (obs.justStarted) {
+              appendLog('KeepAlive', `[${accName}][${dName}] 检测到状态波动 (rawCode=${d.useStatus ?? '空'}, rawText="${norm.statusText}", state=${norm.powerState})，进入防误报观察期（需持续 ${Math.round(CTYUN_OFFLINE_CONFIRM_MS / 60000)} 分钟且连续 ${CTYUN_OFFLINE_CONFIRM_COUNT} 次确认）`, 'info');
+            }
+            // 观察期内若此前确认为运行中，暂保持对外显示为运行中，避免瞬态抖动造成界面闪烁误报
+            if (prev && prev.powerState === 'on') {
+              d.powerState = 'on';
+              d.useStatusText = prev.statusText || '运行中';
+            }
+          } else if (obs.state === 'ready_to_verify') {
+            // 达到持续时长与连续次数门槛，留待 runCycleLoop 做独立 status 视讯通道交叉核验
+            d._pendingOfflineVerify = true;
           }
         }
+        this._lastDesktopsFetchAt = nowTs;
         this.desktopsCache = mergedList;
         this.account.desktops = mergedList;
         for (const d of mergedList) this.checkExternalPowerOn(d);
@@ -2068,9 +2330,10 @@ class CtYunClient {
   }
 
   // 云电脑电源管理操作 (开机: operationType 1 / 唤醒: operationType 18 / 关机: operationType 2 / 重启: operationType 3)
-  async controlPower(desktopId, action) {
+  async controlPower(desktopId, action, options = {}) {
     const accName = this.account.name || this.account.user;
     const actionLower = (action || '').toLowerCase();
+    const silentNotify = !!options.silentNotify;
 
     // 天翼云底层官方电源管控协议 operationType: 1=开机(ON), 18=唤醒(AWAKE), 2=关机(SHUTDOWN), 3=重启(RESET)
     let opType = 3;
@@ -2184,12 +2447,17 @@ class CtYunClient {
     try {
       const data = await sendOperate(opType);
       if (data.code === 0) {
+        if (opType === 3) {
+          this._restartingUntil.set(String(desktopId), Date.now() + CTYUN_RESTART_GUARD_MS);
+        }
         appendLog('System', `[${accName}] ✅ 云电脑【${actionCn}】指令已成功生效！官方返回: 成功`, 'success');
-        sendAccountNotification(
-          this.account,
-          `⚡ 云电脑电源控制生效 - ${accName}`,
-          `已成功向云电脑 [${accName}] 下达【${actionCn}】电源指令，天翼云已确认执行。`
-        );
+        if (!silentNotify) {
+          sendAccountNotification(
+            this.account,
+            `⚡ 云电脑电源控制生效 - ${accName}`,
+            `已成功向云电脑 [${accName}] 下达【${actionCn}】电源指令，天翼云已确认执行。`
+          );
+        }
         return { success: true, message: `云电脑【${actionCn}】指令已成功下发并生效！` };
       } else {
         throw new Error(data.msg || `错误码 ${data.code}`);
@@ -2200,11 +2468,266 @@ class CtYunClient {
     }
   }
 
+  /**
+   * 防误报非运行状态观察器（连续次数 + 持续时间双门槛，彻底过滤单次接口/网关抖动）。
+   * 返回 { state: 'confirmed_on' | 'recovered' | 'starting' | 'observing' | 'ready_to_verify', justStarted, count, elapsedMs }
+   */
+  _updateNonRunningObservation(desktop, now = Date.now(), prevConfirmedState = 'unknown') {
+    const dKey = String(desktop.desktopId || desktop.objId || '');
+    const rawState = desktop.rawPowerState || CtYunClient.normalizePowerState(desktop).powerState;
+    const rawText = desktop.rawStatusText || desktop.useStatusText || '';
+
+    if (rawState === 'on') {
+      const hadTracker = this._nonRunningTracker.has(dKey);
+      if (hadTracker) this._nonRunningTracker.delete(dKey);
+      return { state: hadTracker ? 'recovered' : 'confirmed_on', justStarted: false, count: 0, elapsedMs: 0 };
+    }
+
+    if (rawState === 'starting') {
+      return { state: 'starting', justStarted: false, count: 0, elapsedMs: 0 };
+    }
+
+    let tracker = this._nonRunningTracker.get(dKey);
+    let justStarted = false;
+    if (!tracker) {
+      tracker = {
+        firstSeenAt: now,
+        lastSampleAt: now,
+        count: 1,
+        rawState,
+        rawCode: desktop.useStatus,
+        rawText,
+        confirmedLogged: false,
+        prevConfirmedState
+      };
+      this._nonRunningTracker.set(dKey, tracker);
+      justStarted = true;
+    } else {
+      tracker.rawState = rawState;
+      tracker.rawCode = desktop.useStatus;
+      tracker.rawText = rawText;
+      if (now - tracker.lastSampleAt >= CTYUN_OFFLINE_SAMPLE_MIN_GAP_MS) {
+        tracker.count += 1;
+        tracker.lastSampleAt = now;
+      }
+    }
+
+    const elapsedMs = now - tracker.firstSeenAt;
+    if (tracker.count >= CTYUN_OFFLINE_CONFIRM_COUNT && elapsedMs >= CTYUN_OFFLINE_CONFIRM_MS) {
+      return { state: 'ready_to_verify', justStarted, count: tracker.count, elapsedMs, tracker };
+    }
+    return { state: 'observing', justStarted, count: tracker.count, elapsedMs, tracker };
+  }
+
+  /**
+   * 独立只读视讯通道探测（仅调用 GET /api/desktop/client/status，绝不踢人也不触发 connect 副作用）。
+   * 返回：{ reachable: true, host } | { reachable: false, reason } | { reachable: null, reason }（不可信，禁止据此误判关机）
+   */
+  async probeDesktopOnlineViaStatus(desktopId) {
+    if (!this.loginInfo) return { reachable: null, reason: '未登录' };
+    try {
+      const statusUrl = `https://desk.ctyun.cn:8810/api/desktop/client/status?desktopId=${encodeURIComponent(String(desktopId))}&specifiedCertCategory=1`;
+      const sRes = await fetchWithTimeout(statusUrl, { headers: this.getSignedHeaders() });
+      const sJson = await sRes.json();
+      if (sJson.code === 0) {
+        const host = sJson.data?.desktopInfo?.clinkLvsOutHost || '';
+        if (host) {
+          return { reachable: true, host };
+        }
+        return { reachable: false, reason: 'status 接口返回无在线视讯主机' };
+      }
+      if (sJson.code === 40010 || String(sJson.msg || '').includes('登录信息已过期') || String(sJson.msg || '').includes('会话已过期')) {
+        await this.renewToken().catch(() => {});
+        return { reachable: null, reason: '登录态续期中，暂不判定' };
+      }
+      const msg = String(sJson.msg || `code=${sJson.code}`);
+      if (/关机|休眠|停机|未启动|离线/.test(msg)) {
+        return { reachable: false, reason: msg };
+      }
+      return { reachable: null, reason: msg };
+    } catch (e) {
+      return { reachable: null, reason: `网络探测异常: ${e.message}` };
+    }
+  }
+
+  /** 检查天翼云电脑是否启用自动开机守护（账号级 + 单机双开关默认开启，且非人工关机） */
+  _isAutoBootArmed(desktop) {
+    if (this.account.features?.autoBoot === false) return false;
+    if (desktop && desktop.autoBootEnabled === false) return false;
+    if (this.account.manualShutdown === true) return false;
+    if (desktop && desktop.manualShutdown === true) return false;
+    return true;
+  }
+
+  /** 轮询等待目标天翼云电脑进入运行中状态 */
+  async _waitDesktopReady(desktopId, maxMs = 60000) {
+    const t0 = Date.now();
+    const dIdStr = String(desktopId);
+    while (Date.now() - t0 < maxMs && this.workerRunning) {
+      await new Promise(r => setTimeout(r, 6000));
+      try {
+        const list = await this.getDesktops();
+        const target = (list || []).find(d => String(d.objId || d.desktopId) === dIdStr);
+        if (target && (target.rawPowerState === 'on' || CtYunClient.normalizePowerState(target).powerState === 'on')) {
+          return target;
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  /**
+   * 经防抖达标后的独立交叉核验 + 单台天翼云电脑自愈拉起：
+   * 1. 先查只读 status 视讯通道：若通道在线直接拦截误报，归位 on；若网络不可信则跳过；
+   * 2. 双重确认非运行后，正式记录状态变化与休眠/离线计数；
+   * 3. 满足守护开关与 10 分钟冷却时触发拉起（休眠或不明状态优先 awake 唤醒，明确关机优先 poweron）+ 方案 A 通知。
+   */
+  async _healDesktop(desktop) {
+    const accName = this.account.name || this.account.user;
+    const dId = String(desktop.objId || desktop.desktopId || '');
+    const dName = desktop.objName || desktop.desktopName || dId || '云电脑';
+    const rawState = desktop.rawPowerState || CtYunClient.normalizePowerState(desktop).powerState;
+    const rawText = desktop.rawStatusText || desktop.useStatusText || '非运行中';
+    const now = Date.now();
+
+    if (rawState === 'starting') {
+      appendLog('KeepAlive', `[${accName}][${dName}] 主机处于「${rawText}」状态，等待就绪不重复拉起`, 'info');
+      return { healed: false, skipped: 'starting' };
+    }
+
+    const guardUntil = this._restartingUntil.get(dId) || 0;
+    if (now < guardUntil) {
+      appendLog('KeepAlive', `[${accName}][${dName}] 处于重启保护窗内（状态: ${rawText}），暂不触发自动拉起`, 'info');
+      return { healed: false, skipped: 'restarting' };
+    }
+
+    // 独立只读 status 交叉核验：避免列表接口抖动/滞后导致的假关机误报
+    const probe = await this.probeDesktopOnlineViaStatus(dId);
+    if (probe.reachable === true) {
+      this._nonRunningTracker.delete(dId);
+      desktop.powerState = 'on';
+      desktop.useStatusText = '运行中';
+      desktop.lastPowerState = 'on';
+      this._desktopPowerCache.set(dId, { powerState: 'on', statusText: '运行中' });
+      appendLog('KeepAlive', `[${accName}][${dName}] 交叉核验：视讯通道在线 (${probe.host})，已拦截列表状态假离线误报`, 'info');
+      return { healed: false, skipped: 'false_positive_intercepted' };
+    }
+    if (probe.reachable === null) {
+      appendLog('KeepAlive', `[${accName}][${dName}] 独立 status 核验暂不可信 (${probe.reason})，本轮不误判关机`, 'info');
+      return { healed: false, skipped: 'probe_unverified' };
+    }
+
+    // 双重确认已处于休眠或关机：正式记录状态变化日志与计数（同一段离线期仅记一次）
+    const tracker = this._nonRunningTracker.get(dId);
+    const confirmedState = (rawState === 'sleeping' || rawState === 'unknown') ? 'sleeping' : 'off';
+    const confirmedText = confirmedState === 'sleeping'
+      ? (rawText && rawText !== '状态未知' ? rawText : '休眠中')
+      : (rawText && rawText !== '状态未知' ? rawText : '已关机');
+    desktop.powerState = confirmedState;
+    desktop.useStatusText = confirmedText;
+    desktop.lastPowerState = confirmedState;
+    this._desktopPowerCache.set(dId, { powerState: confirmedState, statusText: confirmedText });
+
+    if (!tracker || !tracker.confirmedLogged) {
+      if (tracker) tracker.confirmedLogged = true;
+      const elapsedMin = tracker ? ((now - tracker.firstSeenAt) / 60000).toFixed(1) : '3.0';
+      appendLog('KeepAlive', `[${accName}][${dName}] 主机状态确认变化: 运行中(on) → ${confirmedText}(${confirmedState}) [连续 ${tracker?.count || CTYUN_OFFLINE_CONFIRM_COUNT} 次 / 持续 ${elapsedMin} 分钟, rawCode=${desktop.useStatus ?? '空'}, 核验=${probe.reason}]`, 'warning');
+      if (confirmedState === 'sleeping') {
+        desktop.sleepCount = (desktop.sleepCount || 0) + 1;
+        this.metrics.sleepCount = (this.metrics.sleepCount || 0) + 1;
+      } else {
+        desktop.offlineCount = (desktop.offlineCount || 0) + 1;
+        this.metrics.offlineCount = (this.metrics.offlineCount || 0) + 1;
+      }
+      desktop.lastPowerStateAt = getBeijingTimeString();
+      this.account.stats = this.account.stats || {};
+      this.account.stats.sleepCount = this.metrics.sleepCount || 0;
+      this.account.stats.offlineCount = this.metrics.offlineCount || 0;
+      saveConfig(appConfig);
+    }
+
+    if (!this._isAutoBootArmed(desktop)) {
+      return { healed: false, skipped: 'not_armed' };
+    }
+
+    const lastBoot = this._autoBootCooldown.get(dId) || 0;
+    if (now - lastBoot < CTYUN_AUTOBOOT_COOLDOWN_MS) {
+      const remainMin = Math.ceil((CTYUN_AUTOBOOT_COOLDOWN_MS - (now - lastBoot)) / 60000);
+      appendLog('KeepAlive', `[${accName}][${dName}] 主机确认处于「${confirmedText}」，自动开机守护冷却中（剩约 ${remainMin} 分钟）`, 'info');
+      return { healed: false, skipped: 'cooldown' };
+    }
+
+    this._autoBootCooldown.set(dId, now);
+    const isSleeping = confirmedState === 'sleeping';
+    // 天翼云 1 小时无保活默认进入休眠（operationType 18 唤醒），明确关机优先 poweron（且 controlPower 内置 1↔18 互补）
+    const actionTarget = isSleeping ? 'awake' : 'poweron';
+    const actionCn = isSleeping ? '唤醒 (awake)' : '开机 (poweron)';
+    const reasonCn = isSleeping ? '休眠唤醒' : '关机拉起';
+
+    appendLog('KeepAlive', `[${accName}][${dName}] 确认主机状态「${confirmedText}」，触发自动开机守护（${actionCn}）…`, 'warning');
+    sendAccountNotification(
+      this.account,
+      isSleeping
+        ? `💤 云电脑检测到休眠，正在自动唤醒`
+        : `⚠️ 云电脑已离线/关机，正在自动拉起`,
+      `主机：${dName} (${dId})\n当前状态：${confirmedText}（已持续核验确认）\n守护动作：已自动下发【${actionCn}】指令，正在轮询等待恢复运行。`
+    );
+
+    let readyDesktop = null;
+    for (let attempt = 1; attempt <= 2 && !readyDesktop; attempt++) {
+      try {
+        const res = await this.controlPower(dId, actionTarget, { silentNotify: true });
+        appendLog('KeepAlive', `[${accName}][${dName}] ${actionCn} 第 ${attempt} 次${res.success ? '已受理' : '未确认: ' + (res.error || '')}，轮询等待就绪…`, res.success ? 'info' : 'warning');
+      } catch (e) {
+        appendLog('KeepAlive', `[${accName}][${dName}] ${actionCn} 第 ${attempt} 次异常: ${e.message}`, 'warning');
+      }
+      readyDesktop = await this._waitDesktopReady(dId, 60000);
+    }
+
+    if (readyDesktop) {
+      const nowStr = getBeijingTimeString();
+      this._nonRunningTracker.delete(dId);
+      readyDesktop.powerState = 'on';
+      readyDesktop.useStatusText = '运行中';
+      readyDesktop.healCount = (readyDesktop.healCount || desktop.healCount || 0) + 1;
+      readyDesktop.lastHealAt = nowStr;
+      readyDesktop.lastHealReason = reasonCn;
+      desktop.healCount = readyDesktop.healCount;
+      desktop.lastHealAt = nowStr;
+      desktop.lastHealReason = reasonCn;
+      this.metrics.healCount = (this.metrics.healCount || 0) + 1;
+      this.metrics.lastHealAt = nowStr;
+      this.metrics.lastHealReason = reasonCn;
+      this.metrics.lastHeartbeatResult = `🎉 自愈恢复 (${reasonCn})`;
+      this.account.stats = this.account.stats || {};
+      this.account.stats.healCount = this.metrics.healCount;
+      this.account.stats.sleepCount = this.metrics.sleepCount || 0;
+      this.account.stats.offlineCount = this.metrics.offlineCount || 0;
+      this.account.stats.lastHealAt = nowStr;
+      this.account.stats.lastHealReason = reasonCn;
+      saveConfig(appConfig);
+
+      appendLog('KeepAlive', `[${accName}][${dName}] 🎉 自动开机守护成功（${reasonCn}）：主机已恢复运行中（累计自愈 ${this.metrics.healCount} 次）`, 'success');
+      sendAccountNotification(
+        this.account,
+        `✅ 云电脑已自愈恢复运行`,
+        `主机：${dName} (${dId})\n自愈方式：${reasonCn}\n当前状态：运行中\n累计自愈：${this.metrics.healCount} 次`
+      );
+      return { healed: true, reason: reasonCn };
+    }
+
+    appendLog('KeepAlive', `[${accName}][${dName}] ${actionCn} 已下发，但等待窗口内尚未进入运行中状态（下轮继续观测）`, 'warning');
+    return { healed: false, pending: true };
+  }
+
   // 检测外部/官网/控制台开机：若之前处于关机/保活关闭，一旦检测到云电脑真正恢复运行中，自动恢复开启保活
   checkExternalPowerOn(desktop) {
     if (!desktop) return;
-    const isRunning = desktop.useStatusText === '运行中' || desktop.useStatus == 25;
-    if (isRunning && !this.resolveTask('keepAlive').enabled) {
+    const isRunning = CtYunClient.normalizePowerState(desktop).powerState === 'on';
+    if (isRunning && desktop.manualShutdown) {
+      desktop.manualShutdown = false;
+    }
+    if (isRunning && !this.resolveTask('keepAlive').enabled && this.account.manualShutdown) {
       this.account.features.keepAlive = true;
       this.account.manualShutdown = false;
       this.account.stats = this.account.stats || {};
@@ -2366,16 +2889,19 @@ class CtYunClient {
 
     let desktopInfo = null;
     let lastConnError = '';
-    // 挂机模式加长重试窗口 (等待开机/网关就绪)：12 次 × 10 秒 ≈ 2 分钟；脉冲模式保持轻量 4 次 × 4 秒
-    const maxConnAttempts = isHangMode ? 12 : 4;
-    const retryGapMs = isHangMode ? 10000 : 4000;
+    // 挂机模式加长重试窗口 (等待开机/网关就绪)：12 次 × 10 秒 ≈ 2 分钟；脉冲模式适度放宽为 5 次 × 5 秒
+    const maxConnAttempts = isHangMode ? 12 : 5;
+    const retryGapMs = isHangMode ? 10000 : 5000;
     for (let connAttempt = 1; connAttempt <= maxConnAttempts; connAttempt++) {
       try {
         desktopInfo = await this.connect(desktopId);
       } catch (e) {
         lastConnError = e.message || '';
       }
-      if (desktopInfo && desktopInfo.clinkLvsOutHost) break;
+      if (desktopInfo && desktopInfo.clinkLvsOutHost) {
+        this._gatewayFailStreak.delete(String(desktopId));
+        break;
+      }
 
       // 先判定【开机/启动中】：此类报错 (如"正在启动中，请稍后再试") 属于等待就绪，绝非客户端占用，绝不误判让位！
       const isBootingMsg = lastConnError.includes('启动') || lastConnError.includes('开机') || lastConnError.includes('初始化') || lastConnError.includes('唤醒');
@@ -2385,6 +2911,7 @@ class CtYunClient {
         lastConnError.includes('正在使用') || lastConnError.includes('使用中') || lastConnError.includes('占用')
       );
       if (isOccupiedMsg) {
+        this._gatewayFailStreak.delete(String(desktopId));
         appendLog('KeepAlive', `[${accName}][${desktopName}] 官方客户端可能正在使用，旁观通道将在下个周期自动重试。`, 'info');
         return { success: true, reason: 'occupied' };
       }
@@ -2397,8 +2924,11 @@ class CtYunClient {
     }
 
     if (!desktopInfo || !desktopInfo.clinkLvsOutHost) {
-      appendLog('KeepAlive', `[${accName}][${desktopName}] 视讯网关暂未分配完毕 (已重试 ${maxConnAttempts} 次)，跳过本次连接`, 'warning');
-      return { success: false, reason: 'no_gateway' };
+      const streak = (this._gatewayFailStreak.get(String(desktopId)) || 0) + 1;
+      this._gatewayFailStreak.set(String(desktopId), streak);
+      const level = streak >= 3 ? 'warning' : 'info';
+      appendLog('KeepAlive', `[${accName}][${desktopName}] 视讯网关暂未分配完毕 (重试 ${maxConnAttempts} 次，连续 ${streak} 轮)，将在下个周期自动重试`, level);
+      return { success: false, reason: 'no_gateway', streak };
     }
 
     this.metrics.currentHost = desktopInfo.clinkLvsOutHost;
@@ -2733,16 +3263,22 @@ class CtYunClient {
         const reasonStr = String(reason || '');
         const heldSec = wsConnectedAt ? Math.floor((Date.now() - wsConnectedAt) / 1000) : 0;
 
-        // 诊断埋点 (零行为改动)：非自身主动关闭时，完整留存判定「真机抢占 vs 网络抖动」所需的全部证据。
-        // 若本行显示"在席信令=无 且 code 未达 4000"，却判定为网络抖动而重连，即为 45 秒循环踢人的直接证据。
-        if (!isClosingSelf) {
-          appendLog('Heartbeat', `[${accName}][${desktopName}] [断开诊断] code=${code} reason="${reasonStr || '(空)'}" 保持=${heldSec}s | 在席信令(119/120/137)=${clientPresenceSignal ? '有' : '无'} 103握手=${handshakeDone ? '已完成' : '未完成'} 112/104认领=${claimSent ? '已发送' : '未发送'} REDQ应答=${redqCount}次 | 模式=${isHangMode ? '挂机认领' : (goalTaskName || '脉冲旁观')}`, 'warning');
-        }
-
         if (isClosingSelf) {
           appendLog('Heartbeat', `[${accName}][${desktopName}] 保活长连接正常轮转关闭 (${code} - ${reason || '周期重连'})`, 'info');
           return;
         }
+
+        // 脉冲旁观模式正常回收：不发送 112/104 认领时，网关在 REDQ + 103/118 认证完成约 5 秒后会主动以 1005 回收未认领通道，
+        // 属于正常协议行为（保活握手已生效且不触发重连），降级为简洁 info 日志避免刷屏误报 warning。
+        if (!isHangMode && !goalTaskName && handshakeDone && redqCount > 0 && !clientPresenceSignal && code === 1005) {
+          appendLog('Heartbeat', `[${accName}][${desktopName}] 脉冲旁观握手已完成 (REDQ=${redqCount}次 / 103+118已认证，保持 ${heldSec}s)，网关正常回收未认领通道 (code=1005)，等待下周期轮转。`, 'info');
+          endSession('Pulse Completed (Gateway Recycle)');
+          return;
+        }
+
+        // 诊断埋点 (零行为改动)：非自身主动关闭时，完整留存判定「真机抢占 vs 网络抖动」所需的全部证据。
+        // 若本行显示"在席信令=无 且 code 未达 4000"，却判定为网络抖动而重连，即为 45 秒循环踢人的直接证据。
+        appendLog('Heartbeat', `[${accName}][${desktopName}] [断开诊断] code=${code} reason="${reasonStr || '(空)'}" 保持=${heldSec}s | 在席信令(119/120/137)=${clientPresenceSignal ? '有' : '无'} 103握手=${handshakeDone ? '已完成' : '未完成'} 112/104认领=${claimSent ? '已发送' : '未发送'} REDQ应答=${redqCount}次 | 模式=${isHangMode ? '挂机认领' : (goalTaskName || '脉冲旁观')}`, 'warning');
 
         // 证据充分：网关明确抢占 (code>=4000 / reason 含 preempt|kick|conflict)
         if (code >= 4000 || reasonStr.includes('preempt') || reasonStr.includes('kick') || reasonStr.includes('conflict')) {
@@ -2850,7 +3386,7 @@ class CtYunClient {
         return { success: false, isCompleted: false, message: '名下无云电脑' };
       }
 
-      const isDesktopRunning = (d) => d && (d.useStatusText === '运行中' || d.useStatus == 25);
+      const isDesktopRunning = (d) => !!(d && CtYunClient.normalizePowerState(d).powerState === 'on');
       // 统一开关入口：挂机是否可作用于该机，只由 cloudHang + desktop.taskEnabled 决定
       const taskOnDesktops = desktops.filter(d => this.resolveTask('cloudHang', d).enabled);
       if (taskOnDesktops.length === 0) {
@@ -2864,12 +3400,14 @@ class CtYunClient {
       const targetId = String(mainDesktop.objId || mainDesktop.desktopId);
 
       if (!isDesktopRunning(mainDesktop)) {
-        if (mainDesktop.autoBootEnabled === false) {
-          onLog('Hang', `[${accName}][${targetName}] 云电脑未开机且已关闭自动开机，跳过本次挂机任务。`, 'info');
+        if (!this._isAutoBootArmed(mainDesktop)) {
+          onLog('Hang', `[${accName}][${targetName}] 云电脑未开机且已关闭自动开机守护，跳过本次挂机任务。`, 'info');
           return { success: true, isCompleted: false, message: '云电脑未开机且已关闭自动开机' };
         }
-        onLog('Hang', `[${accName}][${targetName}] 云电脑未开机，正在下发开机唤醒指令...`, 'info');
-        await this.controlPower(targetId, 'poweron').catch(() => {});
+        const normMain = CtYunClient.normalizePowerState(mainDesktop);
+        const hangBootAction = normMain.powerState === 'sleeping' ? 'awake' : 'poweron';
+        onLog('Hang', `[${accName}][${targetName}] 云电脑处于「${normMain.statusText}」，正在下发${hangBootAction === 'awake' ? '唤醒' : '开机'}指令...`, 'info');
+        await this.controlPower(targetId, hangBootAction, { silentNotify: true }).catch(() => {});
         // 开机就绪轮询 (最长 120 秒)：杜绝未就绪即认领导致官方计时不累加
         let bootReady = false;
         for (let i = 0; i < 12; i++) {
@@ -3084,8 +3622,20 @@ class CtYunClient {
           }).catch(() => {});
         }
 
-        // 1. 查询名下全部云电脑
-        const desktops = await this.getDesktops();
+        // 1. 按需查询名下全部云电脑（常态每 60 秒轮询一次；观察期内 45 秒采样一次；或存在到期保活任务时实时刷新）
+        const defaultPulseGapSec = Math.min(3300, Math.max(10, parseInt(this.account.pulseIntervalSeconds || appConfig.settings?.pulseIntervalSeconds) || 30));
+        const cachedDesktops = (this.desktopsCache && this.desktopsCache.length > 0) ? this.desktopsCache : (this.account.desktops || []);
+        const loopNow = Date.now();
+        const anyPulseDue = cachedDesktops.some(d => {
+          if (!this.resolveTask('keepAlive', d).enabled) return false;
+          const dIntervalSec = Math.min(3300, Math.max(10, parseInt(d.keepaliveInterval) || defaultPulseGapSec));
+          const lastPulse = d.lastPulseAt || 0;
+          return lastPulse === 0 || Math.floor((loopNow - lastPulse) / 1000) >= dIntervalSec;
+        });
+        const pollGapMs = this._nonRunningTracker.size > 0 ? CTYUN_OBSERVE_POLL_INTERVAL_MS : CTYUN_DESKTOP_POLL_INTERVAL_MS;
+        const needFetchDesktops = cachedDesktops.length === 0 || anyPulseDue || (loopNow - this._lastDesktopsFetchAt >= pollGapMs);
+        const desktops = needFetchDesktops ? await this.getDesktops() : cachedDesktops;
+
         if (!desktops || desktops.length === 0) {
           appendLog('KeepAlive', `[${accName}] 账号名下暂无可用云电脑，60秒后重试...`, 'warning');
           this.metrics.status = 'offline';
@@ -3094,29 +3644,13 @@ class CtYunClient {
           continue;
         }
 
-        // 2. 遍历名下所有云电脑，检查开机/休眠状态并自动唤醒未启动机器 (多机独立守护过滤)
-        let hasWokenAny = false;
+        // 2. 仅对「已通过连续 3 次 + 持续 3 分钟防误报观察」的主机执行独立 status 交叉核验与自愈拉起
         for (const d of desktops) {
+          if (!this.workerRunning || this.isTaskHanging) break;
           if (!this.resolveTask('keepAlive', d).enabled) continue; // 统一入口：账号级/单机保活开关
-          const isAutoBootAllowed = d.autoBootEnabled !== false;
-          const isRunning = d && (d.useStatusText === '运行中' || d.useStatus == 25);
-          const dId = d.objId || d.desktopId;
-          const dName = d.objName || d.desktopName || '云电脑';
-          if (!isRunning && isAutoBootAllowed) {
-            if (!this.account.manualShutdown) {
-              const isDormant = (d.useStatusText || '').includes('休眠') || (d.useStatusText || '').includes('睡眠');
-              const actionTarget = isDormant ? 'awake' : 'poweron';
-              const actionCn = isDormant ? '唤醒' : '开机';
-              appendLog('KeepAlive', `[${accName}][${dName}] 处于 [${d.useStatusText || '未启动'}] 状态，自动下发${actionCn}指令...`, 'info');
-              await this.controlPower(dId, actionTarget).catch(() => {});
-              hasWokenAny = true;
-            }
-          }
-        }
-        if (hasWokenAny) {
-          appendLog('KeepAlive', `[${accName}] 已为名下未启动云电脑下发唤醒开机指令，等待启动就绪 (25秒后探测)...`, 'info');
-          await new Promise(r => setTimeout(r, 25000));
-          continue;
+          if (!d._pendingOfflineVerify) continue;
+          d._pendingOfflineVerify = false;
+          await this._healDesktop(d);
         }
 
         // 3. 运行中云电脑常态保活 (多机高精度独立时间戳轮转引擎，100% 旁观者脉冲防休眠)
@@ -3124,7 +3658,6 @@ class CtYunClient {
         this.metrics.status = 'online';
         if (this.account.stats) this.account.stats.keepAliveStatus = 'online';
 
-        const defaultPulseGapSec = Math.min(3300, Math.max(10, parseInt(this.account.pulseIntervalSeconds || appConfig.settings?.pulseIntervalSeconds) || 30));
         const pulseConnectSec = Math.min(60, Math.max(15, appConfig.settings?.keepAliveSeconds || 20));
 
         const now = Date.now();
@@ -3142,13 +3675,18 @@ class CtYunClient {
             continue;
           }
 
-          const isRunning = d && (d.useStatusText === '运行中' || d.useStatus == 25);
+          const isRunning = CtYunClient.normalizePowerState(d).powerState === 'on';
           if (isRunning) {
             this.metrics.desktopId = d.objId || d.desktopId;
             this.metrics.desktopName = d.objName || d.desktopName || '云电脑';
             appendLog('KeepAlive', `[${accName}][${this.metrics.desktopName}] 触发脉冲保活握手 (独立周期: ${dIntervalSec}秒)...`, 'info');
-            await this.runDesktopKeepAliveSession(d, false, pulseConnectSec);
-            d.lastPulseAt = Date.now();
+            const sessionRes = await this.runDesktopKeepAliveSession(d, false, pulseConnectSec);
+            // 若本次仅因视讯网关暂未分配跳过，适度回退 2 分钟后再试（不立刻死循环，也不拖满整小时）
+            if (sessionRes && sessionRes.reason === 'no_gateway' && dIntervalSec > 180) {
+              d.lastPulseAt = Date.now() - Math.max(0, (dIntervalSec - 120) * 1000);
+            } else {
+              d.lastPulseAt = Date.now();
+            }
           }
         }
 
@@ -3257,7 +3795,17 @@ function finalizeEcloudAccount(acc, client) {
 function getClient(acc) {
   if (!clientInstances.has(acc.id)) {
     let client;
-    if (acc.platform === 'ecloud') {
+    if (acc.platform === 'teleagent') {
+      // 天翼星辰（TeleAgent）：独立协议客户端托管，与其余三平台保活实现零共享
+      client = new TeleagentClient(acc, {
+        appendLog,
+        sendNotification: sendAccountNotification,
+        saveConfig: () => saveConfig(appConfig),
+        resolveTaskEnabled: (account, desktop, taskType) => resolveTaskEnabled(account, desktop, taskType)
+      });
+      client.refreshInstances().catch(() => {});
+      client.refreshPointsAndTasks().catch(() => {});
+    } else if (acc.platform === 'ecloud') {
       // 移动公众：独立侧车（Python 协议内核）托管，与另两平台的保活实现零共享
       client = new EcloudClient(acc, {
         appendLog,
@@ -3289,6 +3837,7 @@ function getClient(acc) {
 }
 
 function initAllKeepAlive() {
+  let teleagentIndex = 0;
   for (const acc of appConfig.accounts) {
     if (acc.enabled && acc.features?.keepAlive !== false) {
       const client = getClient(acc);
@@ -3296,6 +3845,16 @@ function initAllKeepAlive() {
         client.refreshVms().then(() => client.startKeepAliveWorker()).catch(() => {});
       } else if (acc.platform === 'ecloud') {
         client.refreshDesktops().then(() => client.startKeepAliveWorker()).catch(() => {});
+      } else if (acc.platform === 'teleagent') {
+        // 多 TeleAgent 账号启动错峰（每账号间隔 1.5s），避免并发触发同 IP 风控；
+        // 且无论首轮实例刷新是否偶发超时，均确保拉起看护循环避免永久停摆。
+        const staggerMs = (teleagentIndex++) * 1500;
+        const bootTimer = setTimeout(() => {
+          client.refreshInstances()
+            .catch(() => {})
+            .finally(() => client.startKeepAliveWorker());
+        }, staggerMs);
+        if (bootTimer.unref) bootTimer.unref();
       } else {
         client.startKeepAliveWorker();
       }
@@ -3820,6 +4379,10 @@ function rewardNeedsDesktop(prodId, prodType) {
     serveStatic(res, path.join(STATIC_DIR, 'index.html'), 'text/html');
     return;
   }
+  if (pathname === '/favicon.png' || pathname === '/favicon.ico') {
+    serveStatic(res, path.join(STATIC_DIR, 'favicon.png'), 'image/png');
+    return;
+  }
   if (pathname.startsWith('/static/')) {
     const rel = pathname.substring(8);
     const file = path.join(STATIC_DIR, rel);
@@ -3828,6 +4391,10 @@ function rewardNeedsDesktop(prodId, prodType) {
       if (rel.endsWith('.css')) type = 'text/css; charset=utf-8';
       else if (rel.endsWith('.js')) type = 'application/javascript; charset=utf-8';
       else if (rel.endsWith('.html')) type = 'text/html; charset=utf-8';
+      else if (rel.endsWith('.png')) type = 'image/png';
+      else if (rel.endsWith('.ico')) type = 'image/x-icon';
+      else if (rel.endsWith('.svg')) type = 'image/svg+xml';
+      else if (rel.endsWith('.webp')) type = 'image/webp';
       serveStatic(res, file, type);
     } else {
       const targetUrl = 'https://pc.ctyun.cn' + pathname;
@@ -3848,7 +4415,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     return;
   }
 
-  // 一键清空持久化历史日志 API
+  // 一键清空持久化历史日志 API（同时清空前端与后端内存/折叠索引，管理员同步清空磁盘 JSONL 历史）
   if (pathname === '/api/logs/clear' && req.method === 'POST') {
     const session = getSessionFromReq(req, parsedUrl);
     if (!session) {
@@ -3856,19 +4423,37 @@ function rewardNeedsDesktop(prodId, prodType) {
       return;
     }
 
+    let clearedDiskFiles = 0;
     if (session.role === 'admin') {
       logs.length = 0;
+      routineFoldIndex.clear();
+      clearedDiskFiles = logPersister.clearAll();
+      // 通知所有管理员 SSE 连接同步清屏
+      for (const client of sseClients) {
+        try {
+          if (client.session && client.session.role === 'admin') {
+            client.res.write(`data: ${JSON.stringify({ __clear: true, by: session.username })}\n\n`);
+          }
+        } catch (e) {
+          sseClients.delete(client);
+        }
+      }
     } else {
-      // 普通用户只清除自身可见日志
+      // 普通用户只清除自身可见日志并清理其折叠索引
+      const removedEntries = new Set();
       for (let i = logs.length - 1; i >= 0; i--) {
         if (canUserSeeLog(session, logs[i])) {
+          removedEntries.add(logs[i]);
           logs.splice(i, 1);
         }
       }
+      for (const [k, v] of routineFoldIndex.entries()) {
+        if (removedEntries.has(v)) routineFoldIndex.delete(k);
+      }
     }
 
-    appendLog('System', `用户 [${session.username}] 执行了一键清空历史日志`, 'info');
-    jsonResponse(res, { success: true, message: '历史日志已彻底清空！' });
+    appendLog('System', `用户 [${session.username}] 执行了一键清空前后端日志${clearedDiskFiles > 0 ? `（已清理 ${clearedDiskFiles} 个磁盘日志文件）` : ''}`, 'info');
+    jsonResponse(res, { success: true, clearedDiskFiles, message: '前端与后端历史日志已彻底清空！' });
     return;
   }
 
@@ -4145,7 +4730,7 @@ function rewardNeedsDesktop(prodId, prodType) {
 
       for (const t of tasks) {
         let completedAt = '';
-        if (t.name.includes('登录AI云电脑')) {
+        if (t.name.includes('登录AI云电脑') || t.name.includes('每日登录')) {
           completedAt = a.stats?.lastSignTime || '';
         } else if (t.name.includes('AI对话')) {
           completedAt = a.stats?.lastAiChatTime || '';
@@ -4175,11 +4760,14 @@ function rewardNeedsDesktop(prodId, prodType) {
       }
 
       totalTodayEarned += accTodayPoints;
+      const totalPtsRaw = a.platform === 'teleagent'
+        ? (client && client.metrics.points !== null && client.metrics.points !== undefined ? client.metrics.points : (a.stats?.points || 0))
+        : ((client && client.metrics.userPoints) ? client.metrics.userPoints : (a.stats?.points || 0));
       pointsDetails.push({
         accountId: a.id,
-        accountName: a.name || a.user,
+        accountName: a.platform === 'teleagent' ? `[星辰] ${a.name || a.user}` : (a.name || a.user),
         todayPoints: accTodayPoints,
-        totalPoints: (client && client.metrics.userPoints) ? client.metrics.userPoints : (a.stats?.points || 0),
+        totalPoints: Number(totalPtsRaw) || 0,
         tasks: completedTasks
       });
     }
@@ -4241,6 +4829,30 @@ function rewardNeedsDesktop(prodId, prodType) {
 
     const enriched = userAccounts.map(acc => {
       const client = getClient(acc);
+      if (acc.platform === 'teleagent') {
+        const taDesktops = (client.metrics?.desktops || acc.desktops || []).map(d => {
+          let keepAliveView = null;
+          try {
+            if (typeof client.describeDesktopKeepAlive === 'function') {
+              keepAliveView = client.describeDesktopKeepAlive(d);
+            }
+          } catch (e) { keepAliveView = null; }
+          return keepAliveView ? { ...d, keepAliveView } : { ...d };
+        });
+        const safeAcc = { ...acc };
+        delete safeAcc.savedJwt;
+        return {
+          ...safeAcc,
+          platform: 'teleagent',
+          authMode: acc.authMode || (acc.password ? 'password' : 'qrcode'),
+          hasJwt: !!client.jwt,
+          jwtExp: client.jwtExp || null,
+          jwtDaysLeft: client.metrics?.jwtDaysLeft ?? null,
+          desktops: taDesktops,
+          vms: taDesktops,
+          liveMetrics: client.metrics
+        };
+      }
       if (acc.platform === 'ecloud') {
         // 移动公众：逐台**序列化时现算**保活视图（倒计时/最近动作必须现算才新鲜），
         // 因此不落盘、不缓存；计算异常时静默回落到原始字段。
@@ -4286,8 +4898,11 @@ function rewardNeedsDesktop(prodId, prodType) {
       }
       const ctyunDesktops = ((client.desktopsCache && client.desktopsCache.length > 0) ? client.desktopsCache : (acc.desktops || [])).map(d => {
         const spec = CtYunClient.extractDesktopSpecs(d, d.flavorName || '公众版');
+        const norm = CtYunClient.normalizePowerState(d);
         return {
           ...d,
+          powerState: norm.powerState,
+          useStatusText: norm.statusText,
           cpu: d.cpu || spec.cpu,
           memory: d.memory || spec.memory,
           specStr: d.specStr || spec.specStr,
@@ -4417,7 +5032,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     const accountType = body.accountType || 'main';
     // 【2026-09-22】移动云账号创建时不显式写入 autoBoot（自动开机守护）：
     // 由账号级 + 单机双开关独立判定，省略即按默认口径（见 ydpc_client.js 的 _autoBootArmed）。
-    const keepaliveInterval = parseInt(body.keepaliveInterval) || 600;
+    const keepaliveInterval = Math.max(60, parseInt(body.keepaliveInterval, 10) || 600);
     const verificationCode = (body.verificationCode || '').trim();
     const randomCode = (body.randomCode || '').trim();
 
@@ -4669,6 +5284,338 @@ function rewardNeedsDesktop(prodId, prodType) {
     return;
   }
 
+  // 7.12 天翼星辰（TeleAgent）独立 API 路由组
+  // ---------------------------------------------------------------
+  // 1) 添加账号（当前实现账号+密码登录；数据模型与客户端已预留 authMode='qrcode' 供下阶段单独实现扫码登录）
+  if (req.method === 'POST' && pathname === '/api/accounts/teleagent/add') {
+    const session = getSessionFromReq(req);
+    if (!session) { jsonResponse(res, { error: '未授权：请先登录或注册账号后再添加云电脑！' }, 401); return; }
+
+    const currentOwnerId = session.userId;
+    const currentUser = authManager.getUserById(currentOwnerId);
+    if (currentUser && currentUser.role !== 'admin') {
+      const currentOwned = appConfig.accounts.filter(a => a.ownerId === currentOwnerId).length;
+      const userMax = currentUser.maxQuota || 2;
+      if (currentOwned >= userMax) {
+        jsonResponse(res, { error: `已达到云电脑添加配额上限（当前配额: ${userMax}台），无法继续添加！请联系管理员提高配额。` }, 400);
+        return;
+      }
+    }
+
+    const body = await parseJsonBody(req);
+    const authMode = body.authMode === 'qrcode' ? 'qrcode' : 'password';
+    if (authMode === 'qrcode') {
+      jsonResponse(res, { error: 'TeleAgent 扫码登录将在兼容完成后单独实现，当前请先使用账号密码登录。' }, 501);
+      return;
+    }
+
+    const user = (body.user || '').trim();
+    const pwd = (body.password || '').trim();
+    const name = (body.name || user).trim();
+    const keepaliveInterval = Math.max(60, parseInt(body.keepaliveInterval, 10) || 300);
+    const reloginDays = Math.max(1, parseInt(body.reloginDays, 10) || 7);
+
+    if (!user || !pwd) { jsonResponse(res, { error: 'TeleAgent 账号与密码不能为空' }, 400); return; }
+    if (appConfig.accounts.some(a => a.platform === 'teleagent' && a.user.toLowerCase() === user.toLowerCase() && a.ownerId === currentOwnerId)) {
+      jsonResponse(res, { error: `TeleAgent 账号 ${user} 已存在，请勿重复添加！` }, 400);
+      return;
+    }
+
+    const accId = 'ta_' + crypto.randomUUID().substring(0, 8);
+    const draftAcc = {
+      id: accId,
+      platform: 'teleagent',
+      authMode: 'password',
+      ownerId: currentOwnerId,
+      name,
+      user,
+      password: pwd,
+      savedJwt: '',
+      jwtExp: null,
+      reloginDays,
+      keepaliveInterval,
+      enabled: true,
+      sessionExpired: false,
+      features: buildTeleagentDefaultFeatures(),
+      desktops: [],
+      stats: {
+        keepAliveStatus: 'offline',
+        lastKeepAliveTime: '',
+        lastSignTime: '',
+        points: 0,
+        planName: '',
+        lastError: ''
+      },
+      createdAt: new Date().toISOString()
+    };
+
+    try {
+      const draftClient = new TeleagentClient(draftAcc, {
+        appendLog,
+        sendNotification: sendAccountNotification,
+        saveConfig: () => saveConfig(appConfig),
+        resolveTaskEnabled: (account, desktop, taskType) => resolveTaskEnabled(account, desktop, taskType)
+      });
+      await draftClient.loginByPassword(user, pwd);
+      const desktops = await draftClient.refreshInstances().catch(() => []);
+      await draftClient.refreshPointsAndTasks().catch(() => {});
+
+      appConfig.accounts.push(draftAcc);
+      clientInstances.set(accId, draftClient);
+      saveConfig(appConfig);
+      draftClient.startKeepAliveWorker();
+
+      appendLog(TELEAGENT_LOG_SOURCE, `[${name}] 天翼星辰（TeleAgent）账号添加成功，发现 ${desktops.length} 台云主机，已启动独立保活守护`, 'success', name, 'teleagent');
+      const safeAcc = { ...draftAcc };
+      delete safeAcc.savedJwt;
+      jsonResponse(res, { success: true, account: safeAcc, desktops, points: draftClient.metrics.points }, 201);
+    } catch (e) {
+      appendLog(TELEAGENT_LOG_SOURCE, `[${name}] 添加 TeleAgent 账号失败: ${e.message}`, 'error', name, 'teleagent');
+      jsonResponse(res, { error: e.message || 'TeleAgent 认证失败' }, 400);
+    }
+    return;
+  }
+
+  // 2) 手动触发一轮 TeleAgent 保活巡检
+  if (req.method === 'POST' && pathname === '/api/accounts/teleagent/keepalive') {
+    const session = getSessionFromReq(req);
+    if (!session) { jsonResponse(res, { error: '未授权' }, 401); return; }
+    const body = await parseJsonBody(req).catch(() => ({}));
+    const acc = appConfig.accounts.find(a => a.id === body.accountId && a.platform === 'teleagent');
+    if (!acc) { jsonResponse(res, { error: '未找到该 TeleAgent 账号' }, 404); return; }
+    if (!canUserAccessAccount(session, acc)) { jsonResponse(res, { error: '权限不足：无权操作该账号' }, 403); return; }
+    const client = getClient(acc);
+    try {
+      const out = await client.runKeepAliveOnce({ manual: true });
+      jsonResponse(res, { success: true, result: out, liveMetrics: client.metrics });
+    } catch (e) {
+      jsonResponse(res, { error: e.message || 'TeleAgent 保活执行失败' }, 400);
+    }
+    return;
+  }
+
+  // 3) 手动触发 TeleAgent 每日登录积分签到
+  if (req.method === 'POST' && pathname === '/api/accounts/teleagent/sign') {
+    const session = getSessionFromReq(req);
+    if (!session) { jsonResponse(res, { error: '未授权' }, 401); return; }
+    const body = await parseJsonBody(req).catch(() => ({}));
+    const acc = appConfig.accounts.find(a => a.id === body.accountId && a.platform === 'teleagent');
+    if (!acc) { jsonResponse(res, { error: '未找到该 TeleAgent 账号' }, 404); return; }
+    if (!canUserAccessAccount(session, acc)) { jsonResponse(res, { error: '权限不足：无权操作该账号' }, 403); return; }
+    const client = getClient(acc);
+    try {
+      const signRes = await client.runDailySign({ trigger: 'manual' });
+      jsonResponse(res, { success: signRes.ok, ...signRes, liveMetrics: client.metrics }, signRes.ok ? 200 : 400);
+    } catch (e) {
+      jsonResponse(res, { error: e.message || 'TeleAgent 每日签到失败' }, 400);
+    }
+    return;
+  }
+
+  // 4) 获取 TeleAgent 云电脑一键直达网页临时票据 URL
+  if (req.method === 'POST' && pathname === '/api/accounts/teleagent/open') {
+    const session = getSessionFromReq(req);
+    if (!session) { jsonResponse(res, { error: '未授权' }, 401); return; }
+    const body = await parseJsonBody(req).catch(() => ({}));
+    const acc = appConfig.accounts.find(a => a.id === body.accountId && a.platform === 'teleagent');
+    if (!acc) { jsonResponse(res, { error: '未找到该 TeleAgent 账号' }, 404); return; }
+    if (!canUserAccessAccount(session, acc)) { jsonResponse(res, { error: '权限不足：无权操作该账号' }, 403); return; }
+    const client = getClient(acc);
+    try {
+      const out = await client.getFreshConnectUrl(body.instanceId || '');
+      jsonResponse(res, out);
+    } catch (e) {
+      jsonResponse(res, { error: e.message || '获取云电脑直达票据失败' }, 400);
+    }
+    return;
+  }
+
+  // 6) 天翼星辰（TeleAgent）官方扫码登录：生成二维码（仅用户手动点击按钮触发）
+  if (req.method === 'POST' && pathname === '/api/accounts/teleagent/qrcode/generate') {
+    const session = getSessionFromReq(req);
+    if (!session) { jsonResponse(res, { error: '未授权：请先登录' }, 401); return; }
+
+    // 清理过期的内存扫码会话（5 分钟 TTL）
+    const now = Date.now();
+    if (!global.__teleagentQrSessions) global.__teleagentQrSessions = new Map();
+    for (const [k, v] of global.__teleagentQrSessions.entries()) {
+      if (!v || now > v.expiresAt + 60000) global.__teleagentQrSessions.delete(k);
+    }
+
+    try {
+      const qr = await teleagentProto.createQrLoginSession();
+      const qrId = 'taqr_' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+      global.__teleagentQrSessions.set(qrId, {
+        ownerId: session.userId,
+        ctx: qr.ctx,
+        expiresAt: qr.expiresAt,
+        createdAt: now,
+      });
+      jsonResponse(res, {
+        success: true,
+        qrId,
+        qrImage: qr.qrImage,
+        expiresAt: qr.expiresAt,
+      });
+    } catch (e) {
+      appendLog(TELEAGENT_LOG_SOURCE, `生成 TeleAgent 官方扫码二维码失败: ${e.message}`, 'error', '', 'teleagent');
+      jsonResponse(res, { success: false, error: e.message || '生成扫码二维码失败' }, 400);
+    }
+    return;
+  }
+
+  // 7) 天翼星辰（TeleAgent）官方扫码登录：轮询扫码状态并在授权后自动接入/续期
+  if (req.method === 'GET' && pathname === '/api/accounts/teleagent/qrcode/status') {
+    const session = getSessionFromReq(req);
+    if (!session) { jsonResponse(res, { error: '未授权' }, 401); return; }
+
+    const qrId = String(parsedUrl.searchParams.get('qrId') || '').trim();
+    const customName = String(parsedUrl.searchParams.get('name') || '').trim();
+    const accId = String(parsedUrl.searchParams.get('accId') || '').trim();
+    const keepaliveInterval = Math.max(60, parseInt(parsedUrl.searchParams.get('keepaliveInterval'), 10) || 300);
+
+    const store = global.__teleagentQrSessions || new Map();
+    const qrSess = store.get(qrId);
+    if (!qrSess || qrSess.ownerId !== session.userId) {
+      jsonResponse(res, { success: true, status: 'expired', message: '扫码会话不存在或已过期，请重新获取二维码' });
+      return;
+    }
+    if (Date.now() > qrSess.expiresAt) {
+      store.delete(qrId);
+      jsonResponse(res, { success: true, status: 'expired', message: '二维码已过期，请点击重新获取' });
+      return;
+    }
+
+    try {
+      const poll = await teleagentProto.pollQrLoginSession(qrSess.ctx, {
+        onLog: (msg, lvl) => appendLog(TELEAGENT_LOG_SOURCE, `[扫码登录] ${msg}`, lvl, customName || '扫码登录', 'teleagent'),
+      });
+      if (poll.status === 'expired') {
+        store.delete(qrId);
+        jsonResponse(res, { success: true, status: 'expired' });
+        return;
+      }
+      if (poll.status !== 'authorized') {
+        jsonResponse(res, { success: true, status: poll.status });
+        return;
+      }
+
+      // 已授权：立即销毁一次性扫码会话
+      store.delete(qrId);
+      const currentOwnerId = session.userId;
+      const userIdent = poll.phoneNumber || poll.accountName || poll.accountId;
+
+      // 重新扫码续期或更新已有同账号
+      let targetAcc = accId
+        ? appConfig.accounts.find(a => a.id === accId && a.platform === 'teleagent' && canUserAccessAccount(session, a))
+        : appConfig.accounts.find(a => a.platform === 'teleagent' && a.ownerId === currentOwnerId && String(a.user || '').toLowerCase() === String(userIdent || '').toLowerCase());
+
+      let isReAuth = false;
+      if (targetAcc) {
+        isReAuth = true;
+        if (customName) targetAcc.name = customName;
+        targetAcc.authMode = 'qrcode';
+        targetAcc.keepaliveInterval = keepaliveInterval;
+        const client = getClient(targetAcc);
+        client.applyQrLoginToken(poll.operationToken);
+        const desktops = await client.refreshInstances().catch(() => []);
+        await client.refreshPointsAndTasks().catch(() => {});
+        if (targetAcc.enabled && targetAcc.features?.keepAlive !== false) {
+          client.startKeepAliveWorker();
+        }
+        saveConfig(appConfig);
+        const safeAcc = { ...targetAcc };
+        delete safeAcc.savedJwt;
+        jsonResponse(res, { success: true, status: 'authorized', isReAuth: true, account: safeAcc, desktops });
+        return;
+      }
+
+      // 新增账号前校验用户配额
+      const currentUser = authManager.getUserById(currentOwnerId);
+      if (currentUser && currentUser.role !== 'admin') {
+        const currentOwned = appConfig.accounts.filter(a => a.ownerId === currentOwnerId).length;
+        const userMax = currentUser.maxQuota || 2;
+        if (currentOwned >= userMax) {
+          jsonResponse(res, { success: false, status: 'error', error: `已达到云电脑添加配额上限（当前配额: ${userMax}台），无法继续添加！` }, 400);
+          return;
+        }
+      }
+
+      const newAccId = 'ta_' + crypto.randomUUID().substring(0, 8);
+      const displayName = customName || `星辰_${String(userIdent).slice(-4) || newAccId.slice(-4)}`;
+      const newAcc = {
+        id: newAccId,
+        platform: 'teleagent',
+        authMode: 'qrcode',
+        ownerId: currentOwnerId,
+        name: displayName,
+        user: userIdent,
+        password: '',
+        savedJwt: '',
+        jwtExp: poll.jwtExp || null,
+        reloginDays: 7,
+        keepaliveInterval,
+        enabled: true,
+        sessionExpired: false,
+        features: buildTeleagentDefaultFeatures(),
+        desktops: [],
+        stats: {
+          keepAliveStatus: 'online',
+          lastKeepAliveTime: '',
+          lastSignTime: '',
+          points: 0,
+          planName: '',
+          lastError: ''
+        },
+        createdAt: new Date().toISOString()
+      };
+
+      const client = new TeleagentClient(newAcc, {
+        appendLog,
+        sendNotification: sendAccountNotification,
+        saveConfig: () => saveConfig(appConfig),
+        resolveTaskEnabled: (account, desktop, taskType) => resolveTaskEnabled(account, desktop, taskType)
+      });
+      client.applyQrLoginToken(poll.operationToken);
+      const desktops = await client.refreshInstances().catch(() => []);
+      await client.refreshPointsAndTasks().catch(() => {});
+
+      appConfig.accounts.push(newAcc);
+      clientInstances.set(newAccId, client);
+      saveConfig(appConfig);
+      client.startKeepAliveWorker();
+
+      appendLog(TELEAGENT_LOG_SOURCE, `[${displayName}] 天翼星辰官方扫码授权成功，发现 ${desktops.length} 台云主机，已启动独立保活守护`, 'success', displayName, 'teleagent');
+      const safeAcc = { ...newAcc };
+      delete safeAcc.savedJwt;
+      jsonResponse(res, { success: true, status: 'authorized', isReAuth: false, account: safeAcc, desktops });
+    } catch (e) {
+      appendLog(TELEAGENT_LOG_SOURCE, `扫码状态轮询/换票异常: ${e.message}`, 'error', customName || '扫码登录', 'teleagent');
+      jsonResponse(res, { success: false, status: 'error', error: e.message || '扫码授权处理失败' }, 400);
+    }
+    return;
+  }
+
+  // 5) 使用保存的账密立即重登刷新 TeleAgent 凭据
+  if (req.method === 'POST' && pathname === '/api/accounts/teleagent/relogin') {
+    const session = getSessionFromReq(req);
+    if (!session) { jsonResponse(res, { error: '未授权' }, 401); return; }
+    const body = await parseJsonBody(req).catch(() => ({}));
+    const acc = appConfig.accounts.find(a => a.id === body.accountId && a.platform === 'teleagent');
+    if (!acc) { jsonResponse(res, { error: '未找到该 TeleAgent 账号' }, 404); return; }
+    if (!canUserAccessAccount(session, acc)) { jsonResponse(res, { error: '权限不足：无权操作该账号' }, 403); return; }
+    const client = getClient(acc);
+    try {
+      await client.loginByPassword();
+      await client.refreshInstances().catch(() => {});
+      await client.refreshPointsAndTasks().catch(() => {});
+      jsonResponse(res, { success: true, jwtDaysLeft: client.metrics.jwtDaysLeft, message: '凭据重登刷新成功' });
+    } catch (e) {
+      jsonResponse(res, { error: e.message || 'TeleAgent 重登失败' }, 400);
+    }
+    return;
+  }
+
   // 8. 添加天翼云账号（包含：必须登录 + 强配额限制 + 真实登录校验）
   if (req.method === 'POST' && pathname === '/api/accounts') {
     const session = getSessionFromReq(req);
@@ -4794,7 +5741,7 @@ function rewardNeedsDesktop(prodId, prodType) {
   }
 
   // 8.8 单台云电脑独立特性开关切换 API (支持移动云 VM 与天翼云 Desktop 独立保活与开机控制)
-  if (req.method === 'PUT' && pathname.match(/^\/api\/accounts\/([^\/]+)\/vm-feature$/)) {
+  if ((req.method === 'PUT' || req.method === 'POST') && pathname.match(/^\/api\/accounts\/([^\/]+)\/vm-feature$/)) {
     const session = getSessionFromReq(req);
     if (!session) {
       jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
@@ -4815,10 +5762,10 @@ function rewardNeedsDesktop(prodId, prodType) {
 
     const body = await parseJsonBody(req);
     const vmKey = String(body.vmId || body.desktopId || body.userServiceId || '');
-    const featureName = body.feature; // 'keepaliveEnabled' | 'autoBootEnabled' | 'taskEnabled' | 'keepaliveInterval'
+    const featureName = body.feature; // 'keepaliveEnabled' | 'autoBootEnabled' | 'taskEnabled' | 'keepaliveInterval' | 'customCron'
     // （数据面保活是账号级 features.dataPlaneKeepalive，在「自动化保活开关」区，不走单机 toggle）
 
-    if (!vmKey || !['keepaliveEnabled', 'autoBootEnabled', 'taskEnabled', 'keepaliveInterval'].includes(featureName)) {
+    if (!vmKey || !['keepaliveEnabled', 'autoBootEnabled', 'taskEnabled', 'keepaliveInterval', 'customCron'].includes(featureName)) {
       jsonResponse(res, { error: '参数错误：必须提供有效的 vmId 与 feature' }, 400);
       return;
     }
@@ -4832,6 +5779,26 @@ function rewardNeedsDesktop(prodId, prodType) {
     if (featureName === 'keepaliveInterval') {
       const num = parseInt(body.value);
       finalValue = (!isNaN(num) && num > 0) ? num : null;
+    } else if (featureName === 'customCron') {
+      const raw = (body.value && typeof body.value === 'object') ? body.value : {};
+      const cleanExpr = (v) => String(v || '').trim().replace(/\s+/g, ' ');
+      const signCron = cleanExpr(raw.signCron);
+      const aiChatCron = cleanExpr(raw.aiChatCron);
+      const cloudHangCron = cleanExpr(raw.cloudHangCron);
+      const redeemCron = cleanExpr(raw.redeemCron);
+      for (const [label, expr] of [['签到打卡', signCron], ['AI 对话', aiChatCron], ['云电脑挂机', cloudHangCron], ['自动兑换', redeemCron]]) {
+        if (expr && expr.split(' ').length !== 5) {
+          jsonResponse(res, { error: `Cron 格式错误：【${label}】必须为 5 段标准表达式（分 时 日 月 周），例如 0 2 * * *` }, 400);
+          return;
+        }
+      }
+      finalValue = {
+        enabled: !!raw.enabled,
+        signCron,
+        aiChatCron,
+        cloudHangCron,
+        redeemCron
+      };
     } else {
       finalValue = body.value !== false;
     }
@@ -4852,11 +5819,23 @@ function rewardNeedsDesktop(prodId, prodType) {
         targetDesktop[featureName] = finalValue;
         updatedTarget = targetDesktop;
       }
+    } else if (acc.platform === 'teleagent') {
+      // 天翼星辰（TeleAgent）每台云电脑同样以 instanceId 为主键，独立存储于 desktops
+      acc.desktops = acc.desktops || [];
+      const targetDesktop = acc.desktops.find(d => String(d.instanceId || d.id) === vmKey);
+      if (targetDesktop) {
+        targetDesktop[featureName] = finalValue;
+        updatedTarget = targetDesktop;
+      }
     } else {
       acc.desktops = acc.desktops || [];
       const targetDesktop = acc.desktops.find(d => String(d.desktopId || d.objId) === vmKey);
       if (targetDesktop) {
         targetDesktop[featureName] = finalValue;
+        if ((featureName === 'autoBootEnabled' || featureName === 'keepaliveEnabled') && finalValue === true) {
+          targetDesktop.manualShutdown = false;
+          acc.manualShutdown = false;
+        }
         updatedTarget = targetDesktop;
       }
     }
@@ -4884,9 +5863,13 @@ function rewardNeedsDesktop(prodId, prodType) {
     if (featureName === 'keepaliveEnabled') featureCn = '独立保活';
     else if (featureName === 'taskEnabled') featureCn = '自动化任务';
     else if (featureName === 'autoBootEnabled') featureCn = '自动开机';
-    else if (featureName === 'keepaliveInterval') featureCn = `独立保活周期 (${finalValue ? Math.round(finalValue/60) + '分钟' : '继承账号默认'})`;
+    else if (featureName === 'keepaliveInterval') featureCn = `独立保活周期 (${finalValue ? (finalValue >= 60 ? Math.round(finalValue / 60) + '分钟' : finalValue + '秒') : '继承账号默认'})`;
+    else if (featureName === 'customCron') featureCn = `单机任务 Cron 规则 (${finalValue && finalValue.enabled ? '已启用' : '继承全局'})`;
 
-    appendLog('System', `[${acc.name}] 已将云主机 [${vmKey}] 的【${featureCn}】更新为: ${finalValue ? (typeof finalValue === 'boolean' ? '开启' : finalValue + '秒') : '关闭/继承'}`, 'info');
+    const valLogText = featureName === 'customCron'
+      ? (finalValue && finalValue.enabled ? `已启用 [签到:${finalValue.signCron || '继承'} / AI:${finalValue.aiChatCron || '继承'} / 挂机:${finalValue.cloudHangCron || '继承'} / 兑换:${finalValue.redeemCron || '继承'}]` : '继承全局调度')
+      : (finalValue ? (typeof finalValue === 'boolean' ? '开启' : finalValue + '秒') : '关闭/继承');
+    appendLog('System', `[${acc.name}] 已将云主机 [${vmKey}] 的【${featureCn}】更新为: ${valLogText}`, 'info');
     jsonResponse(res, { success: true, target: updatedTarget, account: acc });
     return;
   }
@@ -4916,12 +5899,27 @@ function rewardNeedsDesktop(prodId, prodType) {
     if (body.user) acc.user = body.user;
     if (body.password) acc.password = body.password;
     if (body.accountType) acc.accountType = body.accountType;
-    if (body.keepaliveInterval) acc.keepaliveInterval = body.keepaliveInterval;
+    if (body.keepaliveInterval) acc.keepaliveInterval = Math.max(60, parseInt(body.keepaliveInterval, 10) || acc.keepaliveInterval);
+    if (body.reloginDays !== undefined && acc.platform === 'teleagent') {
+      acc.reloginDays = Math.max(1, parseInt(body.reloginDays, 10) || 7);
+    }
     if (body.deviceCode) acc.deviceCode = body.deviceCode;
     if (body.displayConfig) acc.displayConfig = { ...acc.displayConfig, ...body.displayConfig };
     if (typeof body.enabled === 'boolean') acc.enabled = body.enabled;
     if (typeof body.bound === 'boolean') acc.bound = body.bound;
     if (body.features) acc.features = { ...acc.features, ...body.features };
+    if (body.customCron !== undefined && acc.platform === 'teleagent') {
+      const raw = (body.customCron && typeof body.customCron === 'object') ? body.customCron : {};
+      const signCron = String(raw.signCron || '').trim().replace(/\s+/g, ' ');
+      if (signCron && signCron.split(' ').length !== 5) {
+        jsonResponse(res, { error: 'Cron 格式错误：每日积分签到 Cron 必须为 5 段标准表达式（分 时 日 月 周），例如 15 8 * * *' }, 400);
+        return;
+      }
+      acc.customCron = {
+        enabled: !!raw.enabled,
+        signCron
+      };
+    }
     if (body.redeemConfig) acc.redeemConfig = { ...acc.redeemConfig, ...body.redeemConfig };
     if (body.stats) acc.stats = { ...acc.stats, ...body.stats };
 
@@ -4938,9 +5936,27 @@ function rewardNeedsDesktop(prodId, prodType) {
       await client.refreshDesktops().catch(() => {});
     }
 
-    // 用户在界面上明确手动开启了保活开关：解除 manualShutdown 关机阻断
-    if (body.features && body.features.keepAlive === true) {
+    // 天翼星辰（TeleAgent）：同步实例列表与积分状态；如更新了密码或手动要求重登则刷新凭据
+    if (acc.platform === 'teleagent') {
+      const client = getClient(acc);
+      if (body.keepaliveInterval && client.metrics) {
+        client.metrics.keepAliveSeconds = acc.keepaliveInterval;
+      }
+      if (body.password && body.relogin === true) {
+        await client.loginByPassword(acc.user, acc.password).catch(() => {});
+      }
+      await client.refreshInstances().catch(() => {});
+      await client.refreshPointsAndTasks().catch(() => {});
+    }
+
+    // 用户在界面上明确手动开启了保活或自动开机守护开关：解除 manualShutdown 关机阻断
+    if (body.features && (body.features.keepAlive === true || body.features.autoBoot === true)) {
       acc.manualShutdown = false;
+      if (Array.isArray(acc.desktops)) {
+        for (const d of acc.desktops) {
+          if (d) d.manualShutdown = false;
+        }
+      }
     }
 
     // 支持输入验证码重新激活登录
@@ -5458,6 +6474,15 @@ function rewardNeedsDesktop(prodId, prodType) {
     const client = getClient(acc);
 
     try {
+      if (acc.platform === 'teleagent' && taskType === 'sign') {
+        const signRes = await client.runDailySign({ trigger: 'manual' });
+        jsonResponse(res, {
+          success: signRes.ok,
+          message: signRes.message,
+          ...signRes
+        }, signRes.ok ? 200 : 400);
+        return;
+      }
       if (taskType === 'sign') {
         executeNativeSign(client, acc, (src, msg, lvl) => appendLog(src, `[${acc.name}] ${msg}`, lvl))
           .then(async (signRes) => {
@@ -5649,12 +6674,17 @@ function rewardNeedsDesktop(prodId, prodType) {
     const client = getClient(acc);
     try {
       const list = await client.getDesktops();
-      const formatted = list.map(d => ({
-        desktopId: d.objId || d.desktopId,
-        desktopName: d.objName || d.desktopName || '云电脑',
-        prodInstId: d.prodInstId || '',
-        useStatusText: d.useStatusText || '运行中'
-      }));
+      const formatted = list.map(d => {
+        const norm = CtYunClient.normalizePowerState(d);
+        return {
+          desktopId: d.objId || d.desktopId,
+          desktopName: d.objName || d.desktopName || '云电脑',
+          flavorName: d.flavorName || '',
+          prodInstId: d.prodInstId || '',
+          powerState: norm.powerState,
+          useStatusText: norm.statusText
+        };
+      });
       jsonResponse(res, formatted);
     } catch (e) {
       jsonResponse(res, []);
@@ -5745,7 +6775,7 @@ function rewardNeedsDesktop(prodId, prodType) {
     return;
   }
 
-  // 手动下单兑换/抽奖接口
+  // 手动下单兑换接口
   if (req.method === 'POST' && pathname.startsWith('/api/accounts/') && pathname.endsWith('/order')) {
     const session = getSessionFromReq(req);
     if (!session) {
@@ -5944,6 +6974,18 @@ function rewardNeedsDesktop(prodId, prodType) {
         return;
       }
 
+      // 天翼星辰（TeleAgent）：走平台官方 instance/start / instance/restart / instance/cancel 接口
+      if (acc.platform === 'teleagent') {
+        const targetInstance = desktopId || acc.desktops?.[0]?.instanceId || '';
+        if (!targetInstance) {
+          jsonResponse(res, { error: '未指定云电脑实例（缺少 instanceId），请先刷新实例列表' }, 400);
+          return;
+        }
+        const resPower = await client.powerDesktop(targetInstance, actionLower);
+        jsonResponse(res, resPower, resPower.success ? 200 : 400);
+        return;
+      }
+
       // 移动公众（ecloud）：电源控制走平台官方 operate 通道（2026-09-28 接入，真机验证可受理）。
       // 协议取值来自官方 asar 客户端逆向：available=开机（后端不认识 startup/powerOn）/ shutdown / restart。
       // 措辞纪律：成功只报"平台已受理"，受理 ≠ 已生效；最终状态以平台状态刷新为准。
@@ -5988,25 +7030,31 @@ function rewardNeedsDesktop(prodId, prodType) {
 
       const resPower = await client.controlPower(desktopId, action);
       if (resPower.success) {
-        // 核心联动：如果是用户在电源管理主动关机，自动关闭保活开关并打上主动关机标记
+        const targetDesktop = (acc.desktops || []).find(d => String(d.desktopId || d.objId) === String(desktopId));
+        // 核心联动：如果是用户在电源管理主动关机，优先标记单机 manualShutdown；若单机账号则同步关闭账号级保活避免守护拉起
         if (actionLower === 'shutdown' || actionLower === 'poweroff') {
           acc.features = acc.features || {};
-          acc.features.keepAlive = false;
-          acc.manualShutdown = true;
-          acc.stats = acc.stats || {};
-          acc.stats.keepAliveStatus = 'offline';
+          if (targetDesktop) targetDesktop.manualShutdown = true;
+          const allShutdown = !Array.isArray(acc.desktops) || acc.desktops.length <= 1 || acc.desktops.every(d => d.manualShutdown);
+          if (allShutdown) {
+            acc.features.keepAlive = false;
+            acc.manualShutdown = true;
+            acc.stats = acc.stats || {};
+            acc.stats.keepAliveStatus = 'offline';
+            client.stopKeepAliveWorker();
+          }
           saveConfig(appConfig);
-          client.stopKeepAliveWorker();
-          appendLog('System', `[${acc.name}] 用户主动关机，已自动关闭保活开关，机器将维持关机。`, 'info');
+          appendLog('System', `[${acc.name}] 用户主动关机 [${targetDesktop?.desktopName || desktopId}]，已标记人工关机，自动开机守护不会将其拉起。`, 'info');
         } else if (actionLower === 'poweron' || actionLower === 'start' || actionLower === 'awake') {
           acc.features = acc.features || {};
           acc.features.keepAlive = true;
           acc.manualShutdown = false;
+          if (targetDesktop) targetDesktop.manualShutdown = false;
           acc.stats = acc.stats || {};
           acc.stats.keepAliveStatus = 'online';
           saveConfig(appConfig);
           client.startKeepAliveWorker();
-          appendLog('System', `[${acc.name}] 用户主动开机，已自动恢复保活开关与长连接守护。`, 'info');
+          appendLog('System', `[${acc.name}] 用户主动开机 [${targetDesktop?.desktopName || desktopId}]，已解除人工关机标记并恢复保活守护。`, 'info');
         }
 
         jsonResponse(res, { ...resPower, features: acc.features });
@@ -6152,12 +7200,19 @@ function rewardNeedsDesktop(prodId, prodType) {
       jsonResponse(res, { error: '未授权：请登录后再操作' }, 401);
       return;
     }
-    const userNotify = authManager.getUserNotify(session.userId) || {
+    const rawNotify = authManager.getUserNotify(session.userId) || {
       enabled: false,
       channel: 'webhook',
       webhookUrl: '',
       customTitleTemplate: '',
       customContentTemplate: ''
+    };
+    const userNotify = {
+      ...rawNotify,
+      customTitleTemplate: String(rawNotify.customTitleTemplate || '').trim() || DEFAULT_NOTIFY_TITLE_TEMPLATE,
+      customContentTemplate: String(rawNotify.customContentTemplate || '').trim() || DEFAULT_NOTIFY_CONTENT_TEMPLATE,
+      defaultTitleTemplate: DEFAULT_NOTIFY_TITLE_TEMPLATE,
+      defaultContentTemplate: DEFAULT_NOTIFY_CONTENT_TEMPLATE
     };
     jsonResponse(res, userNotify);
     return;
@@ -6283,6 +7338,21 @@ function rewardNeedsDesktop(prodId, prodType) {
       role: session.role,
       settings: session.role === 'admin' ? appConfig.settings : undefined,
       accounts: exportAccounts.map(a => {
+        if (a.platform === 'teleagent') {
+          // 天翼星辰（TeleAgent）标准化导出（保留 authMode 区分账密 / 扫码模式，不导出短期 JWT）
+          return {
+            platform: 'teleagent',
+            authMode: a.authMode || (a.password ? 'password' : 'qrcode'),
+            name: a.name || a.user,
+            user: a.user,
+            password: a.password || '',
+            reloginDays: parseInt(a.reloginDays, 10) || 7,
+            keepaliveInterval: parseInt(a.keepaliveInterval, 10) || 300,
+            enabled: a.enabled !== false,
+            features: a.features || buildTeleagentDefaultFeatures(),
+            desktops: a.desktops || []
+          };
+        }
         if (a.platform === 'ecloud') {
           // 移动公众标准化导出（与 ydpc / ctyun 各自独立的分支，绝不混用字段语义）
           return {
@@ -6391,7 +7461,10 @@ function rewardNeedsDesktop(prodId, prodType) {
       // ── 平台归属判定 (第一优先级：显式 platform 标签绝对优先，绝不篡改) ──
       let isYdpc = false;
       let isEcloud = false;
-      if (item.platform === 'ecloud') {
+      let isTeleagent = false;
+      if (item.platform === 'teleagent') {
+        isTeleagent = true;
+      } else if (item.platform === 'ecloud') {
         isEcloud = true;
       } else if (item.platform === 'ydpc') {
         isYdpc = true;
@@ -6418,10 +7491,10 @@ function rewardNeedsDesktop(prodId, prodType) {
         }
       }
 
-      const platformStr = isEcloud ? 'ecloud' : (isYdpc ? 'ydpc' : 'ctyun');
+      const platformStr = isTeleagent ? 'teleagent' : (isEcloud ? 'ecloud' : (isYdpc ? 'ydpc' : 'ctyun'));
 
-      // ── 天翼云登录模式判定 (authMode === 'qrcode' 或密码为空均视为扫码绑定) ──
-      const isQrAccount = !isYdpc && (item.authMode === 'qrcode' || !item.password);
+      // ── 扫码登录模式判定 (authMode === 'qrcode' 或密码为空均视为扫码绑定) ──
+      const isQrAccount = !isYdpc && !isEcloud && (item.authMode === 'qrcode' || !item.password);
 
       // 如果是 merge，检查手机号/账号名是否已存在同平台账号
       const existing = appConfig.accounts.find(a => a.user === item.user && a.ownerId === targetOwnerId && (a.platform || 'ctyun') === platformStr);
@@ -6429,10 +7502,11 @@ function rewardNeedsDesktop(prodId, prodType) {
         existing.name = item.name || existing.name;
         if (item.password) existing.password = item.password;
         if (isYdpc && item.accountType) existing.accountType = item.accountType;
-        if (isYdpc && item.keepaliveInterval) existing.keepaliveInterval = item.keepaliveInterval;
+        if ((isYdpc || isEcloud || isTeleagent) && item.keepaliveInterval) existing.keepaliveInterval = item.keepaliveInterval;
+        if (isTeleagent && item.reloginDays) existing.reloginDays = parseInt(item.reloginDays, 10) || 7;
+        if (isTeleagent && item.authMode) existing.authMode = item.authMode;
         if (item.deviceCode) existing.deviceCode = item.deviceCode;
         if (isEcloud && item.ecloudDeviceUid) existing.ecloudDeviceUid = item.ecloudDeviceUid;
-        if (isEcloud && item.keepaliveInterval) existing.keepaliveInterval = item.keepaliveInterval;
         if (item.displayConfig) existing.displayConfig = { ...existing.displayConfig, ...item.displayConfig };
         if (item.features) existing.features = { ...existing.features, ...item.features };
         if (item.redeemConfig) existing.redeemConfig = { ...existing.redeemConfig, ...item.redeemConfig };
@@ -6442,10 +7516,11 @@ function rewardNeedsDesktop(prodId, prodType) {
         continue;
       }
 
-      const id = (isYdpc ? 'yd_' : (isEcloud ? 'ec_' : 'ct_')) + crypto.randomUUID().substring(0, 8);
+      const id = (isTeleagent ? 'ta_' : (isYdpc ? 'yd_' : (isEcloud ? 'ec_' : 'ct_'))) + crypto.randomUUID().substring(0, 8);
       const newAcc = {
         id,
         platform: platformStr,
+        authMode: isTeleagent ? (item.authMode || (item.password ? 'password' : 'qrcode')) : undefined,
         ownerId: targetOwnerId,
         accountType: isYdpc ? (item.accountType || 'main') : undefined,
         name: item.name || item.user,
@@ -6453,12 +7528,13 @@ function rewardNeedsDesktop(prodId, prodType) {
         password: item.password || '',
         deviceCode: item.deviceCode || generateDeviceCode(),
         ecloudDeviceUid: isEcloud ? (item.ecloudDeviceUid || crypto.randomUUID()) : undefined,
-        keepaliveInterval: isYdpc ? (parseInt(item.keepaliveInterval) || 600) : (isEcloud ? (parseInt(item.keepaliveInterval) || 300) : undefined),
+        reloginDays: isTeleagent ? (parseInt(item.reloginDays, 10) || 7) : undefined,
+        keepaliveInterval: isYdpc ? (parseInt(item.keepaliveInterval) || 600) : ((isEcloud || isTeleagent) ? (parseInt(item.keepaliveInterval) || 300) : undefined),
         displayConfig: item.displayConfig || { width: 2560, height: 1440, scale: 150 },
         enabled: item.enabled !== false,
-        bound: isYdpc ? true : (item.bound !== false),
+        bound: (isYdpc || isTeleagent) ? true : (item.bound !== false),
         sessionExpired: isQrAccount ? true : false,
-        features: item.features || (isEcloud ? buildEcloudDefaultFeatures() : (isYdpc ? {
+        features: item.features || (isTeleagent ? buildTeleagentDefaultFeatures() : (isEcloud ? buildEcloudDefaultFeatures() : (isYdpc ? {
           keepAlive: true,
           controlPlaneKeepalive: true,
           dataPlaneKeepalive: true
@@ -6470,7 +7546,7 @@ function rewardNeedsDesktop(prodId, prodType) {
           autoRedeem: false,
           // 2026-09-28：移动云自动开机守护默认开启（用户拍板）
           autoBoot: true
-        })),
+        }))),
         redeemConfig: item.redeemConfig || {
           enabled: false,
           targetType: 'redeem',
@@ -6541,11 +7617,19 @@ function rewardNeedsDesktop(prodId, prodType) {
 });
 
 if (require.main === module) {
-  server.listen(PORT, '0.0.0.0', () => {
+  try {
+    acquireInstanceLock();
+  } catch (e) {
+    console.error(`[!] 启动中止: ${e.message}`);
+    process.exit(1);
+  }
+  server.listen(PORT, HOST, () => {
     const isDockerEnv = fs.existsSync('/.dockerenv') || process.env.CTYUN_DATA_DIR === '/app/data';
+    const hostDisplay = HOST === '0.0.0.0' ? '127.0.0.1' : HOST;
     console.log(`===========================================================`);
     console.log(`🚀 天翼云/移动云电脑全功能可视化管理平台已完全就绪！`);
-    console.log(`👉 控制台访问地址: http://127.0.0.1:${PORT}`);
+    if (INSTANCE_NAME) console.log(`🏷️ 实例标识: ${INSTANCE_NAME} (PID ${process.pid})`);
+    console.log(`👉 控制台访问地址: http://${hostDisplay}:${PORT}`);
     console.log(`📁 数据存储目录: ${DATA_DIR} (${isDockerEnv ? 'Docker容器' : '物理机/虚拟机'})`);
     if (isDockerEnv) {
       try {
@@ -6577,5 +7661,8 @@ module.exports = {
   TASK_CN_NAME,
   ECLOUD_KEEPALIVE_TASKS,
   buildEcloudDefaultFeatures,
+  buildTeleagentDefaultFeatures,
+  DEFAULT_NOTIFY_TITLE_TEMPLATE,
+  DEFAULT_NOTIFY_CONTENT_TEMPLATE,
   inferLogPlatform
 };

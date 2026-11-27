@@ -1,11 +1,13 @@
 FROM node:22-bookworm-slim AS builder
 
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+
 WORKDIR /app
 
 COPY package.json package-lock.json ./
 
 # 安装纯净精简生产依赖 (仅需原生 ws 协议库，彻底剔除 C++ 二进制 ONNX/图像框架)
-RUN npm config set registry https://registry.npmmirror.com && \
+RUN npm config set registry "${NPM_REGISTRY}" && \
     npm install --omit=dev --no-audit && \
     rm -rf /root/.npm \
            node_modules/**/README.md \
@@ -16,9 +18,11 @@ RUN npm config set registry https://registry.npmmirror.com && \
            node_modules/**/examples
 
 # -------------------------------------------------------------
-# 运行环境：精简至极致 (压缩后传输仅约 20MB)
+# 运行环境：精简至极致 (兼容 linux/amd64 与 linux/arm64)
 # -------------------------------------------------------------
 FROM node:22-bookworm-slim
+
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 WORKDIR /app
 
@@ -37,7 +41,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone &
     apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates python3 python3-pip && \
     pip3 install --no-cache-dir --break-system-packages \
-        -i https://pypi.tuna.tsinghua.edu.cn/simple \
+        -i "${PIP_INDEX_URL}" \
         requests pycryptodome && \
     rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* /root/.cache
 
